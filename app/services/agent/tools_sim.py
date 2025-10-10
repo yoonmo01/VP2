@@ -152,54 +152,64 @@ def make_sim_tools(db: Session):
     @tool(
         "sim.compose_prompts",
         args_schema=SingleData,
-        description="시나리오/피해자/지침을 바탕으로 공격자/피해자 프롬프트를 생성한다. Action Input은 {'data': {'scenario':{...},'victim_profile':{...},'guidance':{'type':'A|P','text':'...'}}}"
+        description="시나리오/피해자/지침을 바탕으로 공격자/피해자 프롬프트를 생성한다. Action Input은 {'data': {'scenario':{...},'victim_profile':{...},'guidance':{'type':'A|P','text':'...'}, 'round_no':int|null, 'case_id':str|null, 'case_id_override':str|null}}"
     )
     def compose_prompts(data: Any) -> Dict[str, str]:
         """
         prompts.py의 ChatPromptTemplate(ATTACKER_PROMPT / VICTIM_PROMPT)를 사용해
-        'system' 프롬프트 문자열을 생성한다.
-        반환: {"attacker_prompt": <system>, "victim_prompt": <system>}
+        system 프롬프트를 생성하되,
+        - 1라운드 가드: case_id 없고 round_no <= 1 이면 guidance 무시
+        - 안전 규칙 프리앰블을 system 맨 앞에 prepend
         """
         payload = _unwrap_data(data)
         scenario = _unwrap_data(payload.get("scenario") or {})
         victim_profile = _unwrap_data(payload.get("victim_profile") or {})
         guidance = payload.get("guidance") or {}
 
-        # current_step: 시나리오 단계의 첫 항목 > description > 기본값
+        # 🔹 1) 1라운드 가드
+        round_no = payload.get("round_no")
+        case_id  = payload.get("case_id") or payload.get("case_id_override")
+        if guidance and not case_id and (round_no is None or int(round_no) <= 1):
+            guidance = None
+
+        # 🔹 2) current_step 계산
         steps = scenario.get("steps") or []
         description = scenario.get("description") or ""
         current_step = (steps[0] if steps else description) or "시뮬레이션 시작"
 
-        g_type = guidance.get("type", "") or ""
-        g_text = guidance.get("text", "") or ""
+        g_type = (guidance or {}).get("type", "") or ""
+        g_text = (guidance or {}).get("text", "") or ""
 
-        # 1) 공격자 system 프롬프트 렌더링
+        # 🔹 3) 템플릿 기반 생성
         atk_msgs = ATTACKER_PROMPT.format_messages(
-            history=[],          # system만 뽑을 거라 비움
-            last_victim="",      # same
+            history=[],
+            last_victim="",
             current_step=current_step,
             guidance_type=g_type,
             guidance=g_text,
         )
-        attacker_prompt = atk_msgs[0].content  # 첫 메시지가 system
-
-        # 2) 피해자 system 프롬프트 렌더링
         vctx = render_victim_from_profile(victim_profile)
         vic_msgs = VICTIM_PROMPT.format_messages(
-            history=[],          # system만 뽑을 거라 비움
-            last_offender="",    # same
+            history=[],
+            last_offender="",
             meta=vctx["meta"],
             knowledge=vctx["knowledge"],
             traits=vctx["traits"],
             guidance_type=g_type,
             guidance=g_text,
         )
-        victim_prompt = vic_msgs[0].content  # 첫 메시지가 system
+        attacker_prompt = atk_msgs[0].content
+        victim_prompt   = vic_msgs[0].content
 
-        return {
-            "attacker_prompt": attacker_prompt,
-            "victim_prompt": victim_prompt,
-        }
+        # 🔹 4) 안전 규칙 프리앰블 prepend (템플릿에 이미 있다면 중복되지 않도록 간단한 체크)
+        safety = "[규칙] 실제 기관·계좌·전화번호는 금지(가명 사용). 앱 설치/링크 요구는 명시적으로만 표현.\n"
+        if safety not in attacker_prompt:
+            attacker_prompt = f"{safety}{attacker_prompt}"
+        if safety not in victim_prompt:
+            victim_prompt   = f"{safety}{victim_prompt}"
+
+        return {"attacker_prompt": attacker_prompt, "victim_prompt": victim_prompt}
+
 
     @tool(
         "sim.persist_turn",

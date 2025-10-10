@@ -44,7 +44,7 @@ class AdminCase(Base):
     scenario: Mapped[dict] = mapped_column(JSONB, default=dict)
 
     # 기존
-    phishing: Mapped[bool | None] = mapped_column()
+    phishing: Mapped[bool | None] = mapped_column(sa.Boolean, nullable=True)
     evidence: Mapped[str | None] = mapped_column(Text)
     status: Mapped[str] = mapped_column(String(20), default="running")
     defense_count: Mapped[int | None] = mapped_column(Integer, nullable=True)

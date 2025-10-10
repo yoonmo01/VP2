@@ -21,7 +21,7 @@ class SimulationInput(BaseModel):
     scenario: Dict[str, Any] = {}
     victim_profile: Dict[str, Any] = {}
     templates: Dict[str, Any] = {}
-    models: Dict[str, str] = {"attacker": "gpt-4o-mini", "victim": "gemini-1.5-flash"}
+    models: Dict[str, str] = {"attacker": "gpt-4o-mini", "victim": "gemini-2.5-flash-lite"}
     temperature: float = 0.6
 
 class Turn(BaseModel):

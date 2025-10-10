@@ -166,30 +166,30 @@ def build_prompt_package_from_payload(
     req: SimulationStartRequest,
     tavily_result: Optional[Dict[str, Any]] = None,
     *,
-    is_first_run: bool = False,          # ✅ 최초 1회 커스텀만 저장할지 판단
-    skip_catalog_write: bool = True      # ✅ 기본은 저장 금지
+    is_first_run: bool = False,
+    skip_catalog_write: bool = True,
+    enable_scenario_enhancement: bool = True
 ) -> Dict[str, Any]:
-    """
-    - 커스텀 시나리오: is_first_run == True and skip_catalog_write == False 인 경우에만 Attack 카탈로그에 저장
-    - 기존 수법/오펜더 기반: 저장 금지
-    - 반환: 공격자/피해자 프롬프트, 통짜 프롬프트, 그리고 MCP 호출용 mcp_args 포함
-    """
-    # 1) 프로파일/시나리오 로딩 & 정규화
     victim_profile = load_victim_profile(db, req)
 
-    if getattr(req, "custom_scenario", None) and not _is_effectively_empty(req.custom_scenario):
-        seed = req.custom_scenario.model_dump() if hasattr(req.custom_scenario, "model_dump") else dict(req.custom_scenario)
+    # 시나리오 로딩
+    if getattr(req, "custom_scenario", None):
+        seed = req.custom_scenario.model_dump()
         scenario = build_custom_scenario(seed, tavily_result)
-        if is_first_run is True and skip_catalog_write is False:
+        if is_first_run and not skip_catalog_write:
             _ = save_custom_scenario_to_attack(db, scenario)
-    elif getattr(req, "scenario", None) and not _is_effectively_empty(req.scenario):
-        scn = req.scenario.model_dump() if hasattr(req.scenario, "model_dump") else dict(req.scenario)
-        scenario = _norm_scenario(scn)
     else:
-        assert req.offender_id is not None, "offender_id가 필요합니다(커스텀 시나리오 없음)."
+        assert req.offender_id is not None
         scenario = load_scenario_from_offender(db, req.offender_id)
 
-    # 2) 지침 정규화(있으면)
+    # 🔥 시나리오 개선 적용
+    if enable_scenario_enhancement and is_first_run:
+        from app.services.inhanced_scenario_builder import ScenarioEnhancer
+        enhancer = ScenarioEnhancer()
+        scenario = enhancer.enhance_scenario_with_guidance(
+            db=db, base_scenario=scenario, victim_profile=victim_profile)
+
+    # 지침 정규화
     guidance = None
     if getattr(req, "guidance", None):
         g = req.guidance
@@ -198,26 +198,26 @@ def build_prompt_package_from_payload(
         if isinstance(g, dict):
             guidance = {"type": (g.get("type") or "").upper(), "text": g.get("text") or ""}
 
-    # 3) 프롬프트 생성 (요청에 attacker_prompt/victim_prompt가 있으면 우선 사용)
+    # 프롬프트 생성
     attacker_prompt = getattr(req, "attacker_prompt", None)
     victim_prompt   = getattr(req, "victim_prompt", None)
     if not attacker_prompt or not victim_prompt:
+        from app.services.prompt_integrator_db import _build_attacker_prompt, _build_victim_prompt, _combine
         attacker_prompt = _build_attacker_prompt(scenario, guidance)
         victim_prompt   = _build_victim_prompt(victim_profile, guidance)
 
+    from app.services.prompt_integrator_db import _combine
     combined_prompt = _combine(attacker_prompt, victim_prompt)
 
-    # 4) 모델/턴수
-    attacker_model = (getattr(req, "models", {}) or {}).get("attacker") if getattr(req, "models", None) else None
-    victim_model   = (getattr(req, "models", {}) or {}).get("victim")   if getattr(req, "models", None) else None
-    attacker_model = attacker_model or os.getenv("ATTACKER_MODEL", "gpt-4o-mini")
-    victim_model   = victim_model   or os.getenv("VICTIM_MODEL",   "gpt-4o-mini")
+    # 모델/턴수
+    attacker_model = (getattr(req, "models", {}) or {}).get("attacker") or os.getenv("ATTACKER_MODEL","gpt-4o-mini")
+    victim_model   = (getattr(req, "models", {}) or {}).get("victim")   or os.getenv("VICTIM_MODEL","gpt-4o-mini")
     max_turns      = getattr(req, "max_turns", None) or 15
 
-    # 5) MCP 서버 호출용 arguments 구성
-    mcp_args: Dict[str, Any] = {
+    # MCP 인자 구성
+    mcp_args = {
         "offender_id": req.offender_id,
-        "victim_id":   req.victim_id,
+        "victim_id": req.victim_id,
         "scenario": scenario,
         "victim_profile": victim_profile,
         "templates": {"attacker": attacker_prompt, "victim": victim_prompt},
@@ -231,21 +231,19 @@ def build_prompt_package_from_payload(
         mcp_args["round_no"] = int(req.round_no)
     if guidance:
         mcp_args["guidance"] = guidance
-
-    # (옵션) 개별 system도 함께 전달 (MCP 서버가 우선 사용 가능)
     mcp_args["attacker_prompt"] = attacker_prompt
     mcp_args["victim_prompt"]   = victim_prompt
 
-    # 6) 패키지 반환 (에이전트/도구 모두 사용)
     return {
         "scenario": scenario,
         "victim_profile": victim_profile,
         "templates": {"attacker": attacker_prompt, "victim": victim_prompt},
         "attacker_prompt": attacker_prompt,
-        "victim_prompt":   victim_prompt,
+        "victim_prompt": victim_prompt,
         "combined_prompt": combined_prompt,
-        "attacker_model":  attacker_model,
-        "victim_model":    victim_model,
-        "max_turns":       max_turns,
-        "mcp_args":        mcp_args,
+        "attacker_model": attacker_model,
+        "victim_model": victim_model,
+        "max_turns": max_turns,
+        "mcp_args": mcp_args,
     }
+
