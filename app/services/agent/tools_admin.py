@@ -790,10 +790,27 @@ def _persist_verdict(
     # 2) 항상 AdminCase에 최신 요약 + 히스토리 라인 누적
     try:
         case = db.get(m.AdminCase, case_id)
+        # ★ 없으면 최소 AdminCase 생성 (시나리오 모르면 빈 dict로라도 생성)
         if not case:
-            if success:
-                db.commit()
-            return success
+            try:
+                case = m.AdminCase(
+                    id=case_id,
+                    scenario={},           # 시나리오를 모르면 빈 객체라도 저장 (NOT NULL 회피)
+                    phishing=False,
+                    status="running",
+                    defense_count=0,
+                )
+                db.add(case)
+                db.flush()
+            except Exception as e:
+                logger.warning(f"[admin.make_judgement] AdminCase 생성 실패: {e}")
+                # AdminCaseSummary 저장만 성공했어도 persisted는 True로 볼 수 있게 commit
+                if success:
+                    try:
+                        db.commit()
+                    except Exception:
+                        pass
+                return success
 
         # 케이스 단위 phishing은 OR
         case.phishing = bool(getattr(case, "phishing", False) or verdict.get("phishing", False))
@@ -832,7 +849,8 @@ def _persist_verdict(
             db.commit()
         except Exception:
             pass
-        return success
+        # AdminCaseSummary 업서트가 성공했다면 그걸로도 persisted=True로 인정
+        return bool(success)
 
 def _read_persisted_verdict(db: Session, *, case_id: UUID, run_no: int) -> Optional[Dict[str, Any]]:
     # 1) AdminCaseSummary 우선
@@ -987,6 +1005,13 @@ def make_admin_tools(db: Session, guideline_repo):
             }
 
         persisted = _persist_verdict(db, case_id=ji.case_id, run_no=ji.run_no, verdict=verdict)
+        # ★ 방어적: 첫 시도에서 persisted=False면 1회 재시도
+        if not persisted:
+            try:
+                logger.warning("[admin.make_judgement] persisted=False → 1회 재시도")
+                persisted = _persist_verdict(db, case_id=ji.case_id, run_no=ji.run_no, verdict=verdict)
+            except Exception as _:
+                pass
 
         return {
             "ok": True,
@@ -1011,6 +1036,7 @@ def make_admin_tools(db: Session, guideline_repo):
         saved = _read_persisted_verdict(db, case_id=ji.case_id, run_no=ji.run_no)
         if saved is not None:
             out = {
+                "ok": True,
                 "phishing": bool(saved.get("phishing", False)),
                 "reason": str(saved.get("evidence", "")),  # 기존 호환
                 "run_no": ji.run_no,

@@ -56,7 +56,7 @@ class AdminCase(Base):
     last_risk_score: Mapped[int | None] = mapped_column(Integer, nullable=True)
     last_risk_level: Mapped[str | None] = mapped_column(String(20), nullable=True)
     last_risk_rationale: Mapped[str | None] = mapped_column(Text, nullable=True)
-    last_vulnerabilities: Mapped[dict | None] = mapped_column(JSONB, nullable=True)  # list -> JSONB
+    last_vulnerabilities: Mapped[list | None] = mapped_column(JSONB, nullable=True)  # list -> JSONB
     last_recommendation: Mapped[str | None] = mapped_column(String(20), nullable=True)  # continue/stop
     last_recommendation_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
 

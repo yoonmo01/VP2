@@ -8,6 +8,9 @@ from ..db.base import SessionLocal
 from ..db.models import Conversation, TurnLog
 from ..utils.end_rules import attacker_declared_end, VICTIM_END_LINE
 
+import json
+import re
+
 
 # FastMCP 등록용
 from mcp.server.fastmcp import FastMCP
@@ -31,10 +34,10 @@ def register_simulate_dialogue_tool_fastmcp(mcp: FastMCP):
         description="공격자/피해자 LLM 교대턴 시뮬레이션 실행 후 로그 반환 및 DB 저장"
     )
     async def simulate_dialogue(arguments: Dict[str, Any]) -> Dict[str, Any]:
-        # 1) 입력 스키마 검증
+        # 1) 입력 스키마 검증 (⚠️ 템플릿 주입 payload로 검증해야 실제 system 반영)
         try:
             payload = _coerce_input_legacy(arguments)
-            data = SimulationInput.model_validate(arguments)
+            data = SimulationInput.model_validate(payload)
         except ValidationError as ve:
             return {
                 "ok": False,
@@ -46,9 +49,20 @@ def register_simulate_dialogue_tool_fastmcp(mcp: FastMCP):
         # 2) 실제 실행
         try:
             out = simulate_dialogue_impl(data)
-            # out이 Pydantic 모델이면 dump, dict면 그대로
-            result = out.model_dump() if hasattr(out, "model_dump") else out
-            return {"ok": True, "result": result}
+            # out은 dict(평탄화된 결과)로 반환됨. 하위 호환 위해 보호 로직.
+            if hasattr(out, "model_dump"):
+                core = out.model_dump()
+            elif isinstance(out, dict) and "result" in out and len(out) == 1:
+                core = out["result"]
+            else:
+                core = out
+
+            # 최상위에 case_id 동시 제공(오케스트레이터 호환)
+            if isinstance(core, dict):
+                conv_id = core.get("conversation_id")
+                if conv_id and "case_id" not in core:
+                    core["case_id"] = conv_id
+            return {"ok": True, **core}
         except Exception as e:
             import traceback
             tb = traceback.format_exc()
@@ -59,22 +73,58 @@ def register_simulate_dialogue_tool_fastmcp(mcp: FastMCP):
 
 
 def _coerce_input_legacy(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    - templates.attacker / templates.victim 이 '완성된 시스템 프롬프트'면 그대로 system에 주입
+    - victim.system이 비어있고 victim_profile가 있다면 victim_profile 기반으로 system을 생성하여 주입
+    """
     args = dict(arguments or {})
     attacker = args.get("attacker") or {}
     victim = args.get("victim") or {}
+    tpls = (args.get("templates") or {}) if isinstance(args.get("templates"), dict) else {}
 
-    if not (attacker.get("system") and victim.get("system")):
-        tpls = (args.get("templates") or {}) if isinstance(args.get("templates"), dict) else {}
-        atk_tpl = tpls.get("attacker") or ""
-        vic_tpl = tpls.get("victim") or ""
-        if atk_tpl and not attacker.get("system"):
-            attacker["system"] = f"[TEMPLATE:{atk_tpl}] 공격자 기본 시스템 프롬프트"
-        if vic_tpl and not victim.get("system"):
-            victim["system"] = f"[TEMPLATE:{vic_tpl}] 피해자 기본 시스템 프롬프트"
-        args["attacker"] = attacker
-        args["victim"] = victim
+    atk_tpl = tpls.get("attacker") or ""
+    vic_tpl = tpls.get("victim") or ""
 
+    # 1) 템플릿이 이미 '완성된 system 프롬프트'라면 그대로 사용
+    if atk_tpl and not attacker.get("system"):
+        attacker["system"] = atk_tpl
+    if vic_tpl and not victim.get("system"):
+        victim["system"] = vic_tpl
+
+    # 2) 피해자 system이 여전히 비어있다면 victim_profile로 완성
+    if not victim.get("system"):
+        vp = args.get("victim_profile") or {}
+        victim["system"] = _build_victim_system(
+            vp.get("meta", "정보 없음"),
+            vp.get("knowledge", "정보 없음"),
+            vp.get("traits", "정보 없음"),
+        )
+
+    args["attacker"] = attacker
+    args["victim"] = victim
     return args
+
+
+def _build_victim_system(meta: str, knowledge: str, traits: str) -> str:
+    """
+    피해자 LLM용 고정 시스템 프롬프트 (JSON 출력 강제 규칙 포함).
+    필요 시 템플릿/로케일에 맞게 확장 가능.
+    """
+    return (
+        "이것은 보이스피싱 시뮬레이션이며, 당신은 피해자 역할입니다.\n\n"
+        "[캐릭터 정보]\n"
+        f"메타정보: {meta}\n"
+        f"지식정보: {knowledge}\n"
+        f"성격정보: {traits}\n\n"
+        "[응답 규칙]\n"
+        "반드시 JSON 한 객체만 출력:\n"
+        "{\n"
+        '  "is_convinced": 0~10,\n'
+        '  "thoughts": "(속마음 한두 문장)",\n'
+        '  "dialogue": "실제 말하는 대화(1~2문장)"\n'
+        "}\n"
+        "개인정보(주민등록/계좌/카드/CVC 등) 제공 금지, 시뮬레이션 언급 금지.\n"
+    )
 
 # ─────────────────────────────────────────────────────────
 # 순수 구현 함수 (입력 → 실행 → dict 반환)
@@ -217,6 +267,8 @@ def simulate_dialogue_impl(input_obj: SimulationInput) -> Dict[str, Any]:
                 guidance=guidance_text,
                 guidance_type=guidance_type,
             )
+            # ── 피해자 출력 JSON 임시 강제/정규화 가드 ────────────────
+            victim_text = _force_victim_json(victim_text)            
 
             db.add(
                 TurnLog(
@@ -255,8 +307,39 @@ def simulate_dialogue_impl(input_obj: SimulationInput) -> Dict[str, Any]:
             stats={"half_turns": turn_index, "turns": turn_index // 2},
             meta=meta_out,
         )
-        return {"result": result.model_dump()}
+        return result.model_dump()
     finally:
         db.close()
 
 
+# ─────────────────────────────────────────────────────────
+# 출력 보정 유틸
+# ─────────────────────────────────────────────────────────
+def _force_victim_json(text: str) -> str:
+    """
+    피해자 발화를 JSON 한 객체로 강제하는 임시 가드.
+    - 이미 JSON이면 그대로 통과
+    - 자유 텍스트면 1~2문장으로 자르고 JSON 래핑
+    """
+    t = (text or "").strip()
+    if t.startswith("{") and t.endswith("}"):
+        # JSON으로 보이지만 한번 더 간단 검증
+        try:
+            obj = json.loads(t)
+            if isinstance(obj, dict) and {"is_convinced", "thoughts", "dialogue"} <= set(obj.keys()):
+                return t
+        except Exception:
+            pass
+
+    # 자유 텍스트 → 1~2문장으로 축약
+    parts = re.split(r"([.!?])", t)
+    short = "".join(parts[:4]).strip()
+    if not short:
+        short = "그 정보는 전화로 드릴 수 없습니다."
+
+    obj = {
+        "is_convinced": 2,
+        "thoughts": "(조심스럽다.)",
+        "dialogue": short
+    }
+    return json.dumps(obj, ensure_ascii=False)
