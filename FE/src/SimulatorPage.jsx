@@ -4,7 +4,7 @@ import HudBar from "./HudBar";
 import MessageBubble from "./MessageBubble";
 import SpinnerMessage from "./SpinnerMessage";
 import InvestigationBoard from "./InvestigationBoard";
-import TerminalLog from "./components/TerminalLog";
+import TerminalLog from "./TerminalLog";
 import TTSModal from "./components/TTSModal";
 import { FileBarChart2, Home } from "lucide-react";
 
@@ -230,6 +230,11 @@ const SimulatorPage = ({
         >
           <div className="flex-1 overflow-auto p-4">
             <TerminalLog data={displayedAgentLogText} />
+            {/* <TerminalLog
+              logText={rawLogDataFromBackend} // 전체 문자열 그대로 전달
+              height={600}
+            /> 이런 식으로 데이터를 받아와야 컴포넌트 정상 작동함
+            */}
           </div>
           <div className="border-t p-4" style={{ borderColor: COLORS.border }}>
             {sessionResult?.insights ? (
