@@ -1,23 +1,28 @@
-# VP/mcp_server/mcp_server/tools/simulate_dialogue.py
-
 from typing import List, Dict, Any, Optional
 from pydantic import ValidationError
 from ..schemas import SimulationInput, SimulationResult, Turn
 from ..llm.providers import AttackerLLM, VictimLLM
 from ..db.base import SessionLocal
 from ..db.models import Conversation, TurnLog
-from ..utils.end_rules import attacker_declared_end, VICTIM_END_LINE
 
 import json
 import re
 
-
 # FastMCP 등록용
 from mcp.server.fastmcp import FastMCP
+
+# 종료 규칙 유틸(단일 진실원)
+from vp_mcp.mcp_server.utils.end_rules import (
+    attacker_declared_end,      # 공격자 종료 선언 감지 ("여기서 마무리하겠습니다." 변형 포함)
+    victim_declared_end,        # 피해자 dialogue 기준 종료 의사 감지
+    ATTACKER_TRIGGER_PHRASE,    # "여기서 마무리하겠습니다."
+    VICTIM_FINAL_JSON,          # 피해자 마지막 고정 JSON
+)
 
 # 하드캡(안전장치). 필요 시 .env로 이관
 MAX_OFFENDER_TURNS = 60
 MAX_VICTIM_TURNS = 60
+
 
 # ─────────────────────────────────────────────────────────
 # FastMCP에 툴 등록 (server.py에서 호출)
@@ -65,11 +70,8 @@ def register_simulate_dialogue_tool_fastmcp(mcp: FastMCP):
             return {"ok": True, **core}
         except Exception as e:
             import traceback
-            tb = traceback.format_exc()
-            # ❗여기서 절대 예외를 밖으로 던지지 말고 JSON으로 반환
+            # ❗예외를 밖으로 던지지 말고 JSON으로 반환
             return {"ok": False, "error": str(e), "traceback": traceback.format_exc()}
-
-
 
 
 def _coerce_input_legacy(arguments: Dict[str, Any]) -> Dict[str, Any]:
@@ -105,7 +107,7 @@ def _coerce_input_legacy(arguments: Dict[str, Any]) -> Dict[str, Any]:
     return args
 
 
-def _build_victim_system(meta: str, knowledge: str, traits: str) -> str:
+def _build_victim_system(meta: Any, knowledge: Any, traits: Any) -> str:
     """
     피해자 LLM용 고정 시스템 프롬프트 (JSON 출력 강제 규칙 포함).
     필요 시 템플릿/로케일에 맞게 확장 가능.
@@ -126,6 +128,7 @@ def _build_victim_system(meta: str, knowledge: str, traits: str) -> str:
         "개인정보(주민등록/계좌/카드/CVC 등) 제공 금지, 시뮬레이션 언급 금지.\n"
     )
 
+
 # ─────────────────────────────────────────────────────────
 # 순수 구현 함수 (입력 → 실행 → dict 반환)
 # ─────────────────────────────────────────────────────────
@@ -142,10 +145,8 @@ def simulate_dialogue_impl(input_obj: SimulationInput) -> Dict[str, Any]:
         conversation_id: Optional[str] = input_obj.case_id_override
 
         if conversation_id:
-            # 이어달리기: 기존 row가 있으면 ended_by 업데이트만 수행, 없으면 TurnLog에만 이어쓴다.
             conv = db.get(Conversation, conversation_id)
             if conv is None:
-                # 없을 수도 있으므로, 없는 경우에도 TurnLog에는 정상 기록되도록 conv는 None으로 둔다.
                 conv = None
         else:
             meta = {
@@ -157,7 +158,7 @@ def simulate_dialogue_impl(input_obj: SimulationInput) -> Dict[str, Any]:
             }
             conv = Conversation.create(db, meta=meta)
             conversation_id = conv.id
-        
+
         print(">> models:", input_obj.models)
 
         # 2) LLM 준비
@@ -184,29 +185,40 @@ def simulate_dialogue_impl(input_obj: SimulationInput) -> Dict[str, Any]:
         guidance_type = (input_obj.guidance or {}).get("type") or ""
         max_turns = input_obj.max_turns
 
+        # 상태 관리 변수
+        state = "running"  # running | awaiting_victim_final | ended
+        ended_by = ""
+        end_reason = ""
+        end_turn: Optional[int] = None
+
         # 4) 루프 (티키타카 기준)
         for _ in range(max_turns):
+            if state != "running":
+                break
+
             # ── 공격자 발화 ─────────────────────────────
             if attacks >= MAX_OFFENDER_TURNS:
+                ended_by = "max_offender_turns"
+                end_reason = "offender_turn_cap"
+                state = "ended"
+                end_turn = (turn_index - 1) if (turn_index - 1) >= 0 else None
                 break
 
             attacker_text = atk.next(
                 history=history_attacker,
                 last_victim=last_victim_text,
-                current_step="",  # step-lock이 필요하면 input_obj.scenario에서 파생 가능
+                current_step="",  # 필요 시 단계 주입
                 guidance=guidance_text,
                 guidance_type=guidance_type,
             )
 
             # 저장(반쪽턴: 공격자)
-            db.add(
-                TurnLog(
-                    conversation_id=conversation_id,
-                    idx=turn_index,
-                    role="offender",
-                    text=attacker_text,
-                )
-            )
+            db.add(TurnLog(
+                conversation_id=conversation_id,
+                idx=turn_index,
+                role="offender",
+                text=attacker_text,
+            ))
             db.commit()
             turns.append(Turn(role="offender", text=attacker_text))
 
@@ -222,18 +234,20 @@ def simulate_dialogue_impl(input_obj: SimulationInput) -> Dict[str, Any]:
             turn_index += 1
             attacks += 1
 
-            # 공격자 종료 선언 → 피해자 한 줄 후 종료
+            # 공격자 종료 선언 → 피해자 고정 한 줄 후 종료
             if attacker_declared_end(attacker_text):
+                state = "awaiting_victim_final"
+                ended_by = "attacker_end"
+                end_reason = "protocol_termination"
+
                 if replies < MAX_VICTIM_TURNS:
-                    victim_text = VICTIM_END_LINE
-                    db.add(
-                        TurnLog(
-                            conversation_id=conversation_id,
-                            idx=turn_index,
-                            role="victim",
-                            text=victim_text,
-                        )
-                    )
+                    victim_text = VICTIM_FINAL_JSON
+                    db.add(TurnLog(
+                        conversation_id=conversation_id,
+                        idx=turn_index,
+                        role="victim",
+                        text=victim_text,
+                    ))
                     db.commit()
                     turns.append(Turn(role="victim", text=victim_text))
                     try:
@@ -245,15 +259,20 @@ def simulate_dialogue_impl(input_obj: SimulationInput) -> Dict[str, Any]:
                     turn_index += 1
                     replies += 1
 
-                ended_by = "attacker_end"
                 if conv is not None:
                     conv.ended_by = ended_by
-                    db.add(conv)
-                    db.commit()
+                    db.add(conv); db.commit()
+
+                state = "ended"
+                end_turn = (turn_index - 1) if (turn_index - 1) >= 0 else None
                 break
 
             # ── 피해자 발화 ─────────────────────────────
             if replies >= MAX_VICTIM_TURNS:
+                ended_by = "max_victim_turns"
+                end_reason = "victim_turn_cap"
+                state = "ended"
+                end_turn = (turn_index - 1) if (turn_index - 1) >= 0 else None
                 break
 
             victim_meta = input_obj.victim_profile.get("meta")
@@ -269,17 +288,15 @@ def simulate_dialogue_impl(input_obj: SimulationInput) -> Dict[str, Any]:
                 guidance=guidance_text,
                 guidance_type=guidance_type,
             )
-            # ── 피해자 출력 JSON 임시 강제/정규화 가드 ────────────────
-            victim_text = _force_victim_json(victim_text)            
+            # 피해자 출력 JSON 강제/정규화
+            victim_text = _force_victim_json(victim_text)
 
-            db.add(
-                TurnLog(
-                    conversation_id=conversation_id,
-                    idx=turn_index,
-                    role="victim",
-                    text=victim_text,
-                )
-            )
+            db.add(TurnLog(
+                conversation_id=conversation_id,
+                idx=turn_index,
+                role="victim",
+                text=victim_text,
+            ))
             db.commit()
             turns.append(Turn(role="victim", text=victim_text))
 
@@ -294,6 +311,52 @@ def simulate_dialogue_impl(input_obj: SimulationInput) -> Dict[str, Any]:
             turn_index += 1
             replies += 1
 
+            # 피해자 종료 의사 → 공격자 한 줄 주입 후 즉시 종료
+            if victim_declared_end(victim_text):
+                if attacks < MAX_OFFENDER_TURNS:
+                    attacker_text = ATTACKER_TRIGGER_PHRASE  # "여기서 마무리하겠습니다."
+                    db.add(TurnLog(
+                        conversation_id=conversation_id,
+                        idx=turn_index,
+                        role="offender",
+                        text=attacker_text,
+                    ))
+                    db.commit()
+                    turns.append(Turn(role="offender", text=attacker_text))
+                    try:
+                        from langchain_core.messages import AIMessage, HumanMessage
+                        history_attacker.append(AIMessage(attacker_text))
+                        history_victim.append(HumanMessage(attacker_text))
+                    except Exception:
+                        pass
+                    turn_index += 1
+                    attacks += 1
+
+                ended_by = "victim_end_mapped"
+                end_reason = "victim_termination_signal"
+                if conv is not None:
+                    conv.ended_by = ended_by
+                    db.add(conv); db.commit()
+
+                state = "ended"
+                end_turn = (turn_index - 1) if (turn_index - 1) >= 0 else None
+                break
+
+        else:
+            # 루프가 break 없이 자연 종료됨 (max_turns 소진 등)
+            if state == "running":
+                state = "ended"
+                ended_by = ended_by or "turn_limit"
+                end_reason = end_reason or "max_turns_reached"
+                end_turn = (turn_index - 1) if (turn_index - 1) >= 0 else None
+
+        # 루프 이후 ended_by 보정(하드캡/기타 사유로 종료 시 DB ended_by 비어있을 수 있음)
+        if 'ended_by' in locals():
+            if (conv is not None) and ((conv.ended_by or "") == "") and ((ended_by or "") != ""):
+                conv.ended_by = ended_by
+                db.add(conv)
+                db.commit()
+
         # 5) 결과 구성
         meta_out = {
             "offender_id": input_obj.offender_id,
@@ -302,11 +365,15 @@ def simulate_dialogue_impl(input_obj: SimulationInput) -> Dict[str, Any]:
             "guidance": input_obj.guidance or {},
             "scenario": input_obj.scenario,
             "models": input_obj.models,
+            "state": state,
+            "ended_by": (ended_by or ((conv.ended_by if conv is not None else "") or "")),
+            "end_reason": end_reason,
+            "end_turn": end_turn,
         }
         result = SimulationResult(
             conversation_id=conversation_id,
             turns=turns,
-            ended_by=(conv.ended_by if conv is not None else "") or "",
+            ended_by=(conv.ended_by if conv is not None else "") or (ended_by or ""),
             stats={"half_turns": turn_index, "turns": turn_index // 2},
             meta=meta_out,
         )
@@ -326,7 +393,6 @@ def _force_victim_json(text: str) -> str:
     """
     t = (text or "").strip()
     if t.startswith("{") and t.endswith("}"):
-        # JSON으로 보이지만 한번 더 간단 검증
         try:
             obj = json.loads(t)
             if isinstance(obj, dict) and {"is_convinced", "thoughts", "dialogue"} <= set(obj.keys()):
@@ -334,7 +400,6 @@ def _force_victim_json(text: str) -> str:
         except Exception:
             pass
 
-    # 자유 텍스트 → 1~2문장으로 축약
     parts = re.split(r"([.!?])", t)
     short = "".join(parts[:4]).strip()
     if not short:
