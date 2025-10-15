@@ -32,7 +32,7 @@ def render_attacker_from_offender(offender: Dict[str, Any]) -> Dict[str, str]:
 # ─────────────────────────────────────────────────────────────
 ATTACKER_PROMPT = ChatPromptTemplate.from_messages([
     ("system", """
-     너는 보이스피싱 시뮬레이션의 피싱범 역할이다.
+     이것은 보이스피싱 상황을 가정한 **시뮬레이션 대화**다. 너는 공격자 역할의 발화 예시를 생성한다.
 
      [기본 규칙]
      - 오직 아래 [현재 단계]에 적힌 행동에 해당하는 대사만 말한다.
