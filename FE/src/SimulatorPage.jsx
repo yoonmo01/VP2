@@ -18,7 +18,7 @@ import InvestigationBoard from "./InvestigationBoard";
 import TTSModal from "./components/TTSModal";
 import CustomScenarioButton from "./CustomScenarioButton";
 import CustomScenarioModal from "./CustomScenarioModal";
-import TerminalLog from "./components/TerminalLog";
+import TerminalLog from "./TerminalLog";
 import InlinePhishingSummaryBox from "./InlinePhishingSummaryBox";
 import { THEME as BASE_THEME } from "./constants/colors";
 
@@ -37,10 +37,21 @@ const getVictimImage = (photoPath) => {
   return null;
 };
 
-const countChatMessages = (messages = []) =>
-  Array.isArray(messages)
-    ? messages.filter((m) => (m?.type ?? m?._kind) === "chat").length
-    : 0;
+  // 진행률 계산
+  const countChatMessages = (msgs = []) =>
+    msgs.filter((m) => (m?.type ?? m?._kind) === "chat").length;
+
+  useEffect(() => {
+    if (typeof setProgress !== "function") return;
+    const pct = Math.min(100, Math.round((countChatMessages(messages) / 10) * 100));
+    setProgress(pct);
+  }, [messages, setProgress]);
+
+  // 보드 표시 지연
+  useEffect(() => {
+    const timer = setTimeout(() => setShowBoardContent(true), 3000);
+    return () => clearTimeout(timer);
+  }, []);
 
 const SimulatorPage = ({
   COLORS,
@@ -83,6 +94,11 @@ const SimulatorPage = ({
   const [customScenarios, setCustomScenarios] = useState([]);
   const [customVictims, setCustomVictims] = useState([]);
   const [openTTS, setOpenTTS] = useState(false);
+
+  // 🎯 백엔드 데이터 구조 기반 state
+  const [agentLogText, setAgentLogText] = useState("");     // <TerminalLog />용
+  const [insightsList, setInsightsList] = useState([]);     // <InvestigationBoard />용
+  const scrollContainerRef = useRef(null);
   const [activeAgentTab, setActiveAgentTab] = useState("log");
   const [showBoardContent, setShowBoardContent] = useState(false);
 
@@ -136,16 +152,45 @@ const SimulatorPage = ({
     setShowCustomModal(false);
   };
 
-  /* ----------------------------------------------------------
-   📊 진행률 계산
-  ---------------------------------------------------------- */
-  useEffect(() => {
-    const pct = Math.min(
-      100,
-      Math.round((countChatMessages(messages) / 10) * 100)
-    );
-    setProgress(pct);
-  }, [messages, setProgress]);
+   // 🔻 임시: 백엔드 연결 전 더미 데이터 구조 (형태 맞춤) => 이런 느낌으로 맞춰야 함
+    useEffect(() => {
+      const mockLog = `
+      Action: mcp.simulator_run
+      Action Input: {"offender_id":1,"victim_id":1}
+      ---
+      Thought: 분석 실행 중...
+      Result: OK
+      `;
+          const mockInsights = [
+            {
+              run_no: 1,
+              phishing: true,
+              evidence: "피해자가 계좌번호를 전달함.",
+              risk: { score: 85, level: "high", rationale: "낯선 번호에 즉시 응답" },
+              victim_vulnerabilities: ["낯선 전화 응답", "계좌번호 노출"],
+            },
+            {
+              run_no: 2,
+              phishing: false,
+              evidence: "피해자가 의심하여 통화를 종료함.",
+              risk: { score: 40, level: "low", rationale: "경계심 강화됨" },
+              victim_vulnerabilities: [],
+            },
+          ];
+          setAgentLogText(mockLog);
+          setInsightsList(mockInsights);
+      }, []);
+
+       // 메시지 표준화
+      const normalizeMessage = (m) => {
+        const role = (m?.sender || m?.role || "").toLowerCase();
+        return {
+          ...m,
+          label: role === "offender" ? "피싱범" : role === "victim" ? "피해자" : "시스템",
+          side: role === "offender" ? "left" : role === "victim" ? "right" : "center",
+          _kind: "chat",
+        };
+      };
 
   const hasChatLog = useMemo(() => countChatMessages(messages) > 0, [messages]);
 
@@ -495,7 +540,7 @@ const SimulatorPage = ({
               )}
 
               {/* 3️⃣ 시뮬레이션 대화 */}
-              {!needScenario && !needCharacter && (
+              {/* {!needScenario && !needCharacter && (
                 <>
                   {!messages.some((m) => m.type === "chat") ? (
                     <SpinnerMessage simulationState={simulationState} COLORS={THEME} />
@@ -514,7 +559,70 @@ const SimulatorPage = ({
                     <InlinePhishingSummaryBox preview={sessionResult.preview} />
                   )}
                 </>
+              )} */}
+
+               <div className="flex flex-1 min-h-0">
+            {/* 왼쪽: 대화 */}
+            <div className="flex-1 p-6 overflow-y-auto" ref={scrollContainerRef}>
+              {!messages.length && (
+                <SpinnerMessage simulationState={simulationState} COLORS={THEME} />
               )}
+              {messages.map((m, idx) => {
+                const nm = normalizeMessage(m);
+                return (
+                  <MessageBubble
+                    key={idx}
+                    message={nm}
+                    label={nm.label}
+                    side={nm.side}
+                    role={nm.role}
+                    COLORS={THEME}
+                  />
+                );
+              })}
+            </div>
+
+            {/* 오른쪽: 로그 / 분석 */}
+            {hasChatLog && (
+              <div
+                className="flex flex-col w-[30%] border-l"
+                style={{ borderColor: THEME.border, backgroundColor: THEME.panelDark }}
+              >
+                <div className="flex items-center border-b" style={{ borderColor: THEME.border }}>
+                  <button
+                    onClick={() => setActiveAgentTab("log")}
+                    className={`flex-1 py-2 font-semibold ${
+                      activeAgentTab === "log" ? "text-yellow-400" : "text-gray-400"
+                    }`}
+                  >
+                    <Terminal size={14} className="inline mr-2" />
+                    로그
+                  </button>
+                  <button
+                    onClick={() => setActiveAgentTab("insight")}
+                    className={`flex-1 py-2 font-semibold ${
+                      activeAgentTab === "insight" ? "text-yellow-400" : "text-gray-400"
+                    }`}
+                  >
+                    <Lightbulb size={14} className="inline mr-2" />
+                    분석
+                  </button>
+                </div>
+
+                <div className="flex-1 overflow-auto">
+                  {activeAgentTab === "log" ? (
+                    <TerminalLog logText={agentLogText} COLORS={THEME} />
+                  ) : showBoardContent ? (
+                    <InvestigationBoard COLORS={THEME} insightsList={insightsList} />
+                  ) : (
+                    <div className="p-6 text-sm text-center" style={{ color: THEME.sub }}>
+                      분석 보드를 준비 중입니다...
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+          </div>
 
               {/* 시뮬레이션 시작 버튼 */}
               {selectedScenario &&
