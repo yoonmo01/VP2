@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import Dict, Any, List, Tuple, Optional
+from typing import Dict, Any, List, Tuple, Optional, Set, AsyncGenerator
 from dataclasses import dataclass, field
 import json
 import re
@@ -38,55 +38,127 @@ EXPECT_GUIDANCE_KEY = "type"   # ← 서버가 kind를 요구하면 "kind"로 �
 EXPECT_MCP_DATA_WRAPPER = False  # True면 {"data": {...}} 래핑, False면 언랩
 
 # (SSE) 필요한 모듈
-import asyncio, logging, uuid, contextvars, contextlib
-from typing import AsyncGenerator
+import asyncio, logging, uuid, contextvars, contextlib, sys
 from starlette.responses import StreamingResponse
 from fastapi import APIRouter, status
 
-# (SSE) run별 큐 보관소와 컨텍스트 stream_id
-_SSE_QUEUES: dict[str, asyncio.Queue] = {}
+# ── (고급 SSE) 스트림 상태: 루프, 메인 브로드캐스트 큐, 외부 구독자(sinks)
+_StreamState = Tuple[asyncio.AbstractEventLoop, asyncio.Queue, Set[asyncio.Queue]]
+
+_STREAMS: dict[str, _StreamState] = {}
 _current_stream_id: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("_current_stream_id", default=None)
 
-def _get_queue(stream_id: str) -> asyncio.Queue:
-    q = _SSE_QUEUES.get(stream_id)
-    if q is None:
-        q = asyncio.Queue()
-        _SSE_QUEUES[stream_id] = q
-    return q
+def _ensure_stream(stream_id: str) -> _StreamState:
+    state = _STREAMS.get(stream_id)
+    if state is None:
+        loop = asyncio.get_running_loop()
+        main_q: asyncio.Queue = asyncio.Queue()
+        sinks: Set[asyncio.Queue] = set()
+        state = (loop, main_q, sinks)
+        _STREAMS[stream_id] = state
+    return state
+
+def _get_loop(stream_id: str) -> asyncio.AbstractEventLoop:
+    return _ensure_stream(stream_id)[0]
+
+def _get_main_queue(stream_id: str) -> asyncio.Queue:
+    return _ensure_stream(stream_id)[1]
+
+def _get_sinks(stream_id: str) -> Set[asyncio.Queue]:
+    return _ensure_stream(stream_id)[2]
+
+def sse_current_stream_id() -> Optional[str]:
+    """현재 실행 컨텍스트에 바인딩된 stream_id 반환 (없으면 None)"""
+    return _current_stream_id.get()
+
+async def register_sink_to_current_stream(sink_q: asyncio.Queue) -> bool:
+    """외부(예: MCPController)에서 현재 스트림에 sink 큐를 구독자로 등록"""
+    sid = _current_stream_id.get()
+    if not sid:
+        return False
+    _get_sinks(sid).add(sink_q)
+    return True
+
+async def unregister_sink_from_current_stream(sink_q: asyncio.Queue) -> None:
+    """현재 스트림에서 sink 큐 구독 해제"""
+    sid = _current_stream_id.get()
+    if not sid:
+        return
+    _get_sinks(sid).discard(sink_q)
 
 async def _sse_event_generator(stream_id: str) -> AsyncGenerator[bytes, None]:
-    queue = _get_queue(stream_id)
+    loop, main_q, sinks = _ensure_stream(stream_id)
 
     async def heartbeat():
         while True:
             await asyncio.sleep(15)
             try:
-                await queue.put({"type": "heartbeat", "ts": datetime.now().isoformat()})
+                await main_q.put({"type": "heartbeat", "ts": datetime.now().isoformat()})
             except Exception:
                 break
 
-    hb_task = asyncio.create_task(heartbeat())
-    try:
+    async def fan_in_from_sinks():
+        # 각 sink에서 들어오는 이벤트를 main_q로 합류
         while True:
-            msg = await queue.get()
+            try:
+                if not sinks:
+                    await asyncio.sleep(0.1)
+                    continue
+                for sq in list(sinks):
+                    try:
+                        item = sq.get_nowait()
+                    except asyncio.QueueEmpty:
+                        continue
+                    else:
+                        await main_q.put({"type": "turn_event", "content": item, "ts": datetime.now().isoformat()})
+                await asyncio.sleep(0)
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.exception("[SSE] fan_in_from_sinks error")
+                await asyncio.sleep(0.5)
+
+    hb_task = asyncio.create_task(heartbeat())
+    fanin_task = asyncio.create_task(fan_in_from_sinks())
+
+    try:
+        # 최초 핑
+        await main_q.put({"type": "ping", "ts": datetime.now().isoformat(), "stream_id": stream_id})
+
+        while True:
+            msg = await main_q.get()
             payload = json.dumps(msg, ensure_ascii=False)
             yield f"data: {payload}\n\n".encode("utf-8")
     except asyncio.CancelledError:
         pass
     finally:
-        hb_task.cancel()
-        try:
-            _SSE_QUEUES.pop(stream_id, None)
-        except Exception:
-            pass
+        for t in (hb_task, fanin_task):
+            t.cancel()
+        _STREAMS.pop(stream_id, None)
+
+def _truncate(obj: Any, max_len: int = 800) -> Any:
+    """긴 문자열을 로그용으로 안전하게 자르기"""
+    try:
+        if isinstance(obj, str):
+            return (obj[:max_len] + "…") if len(obj) > max_len else obj
+        if isinstance(obj, list):
+            return [_truncate(x, max_len) for x in obj]
+        if isinstance(obj, dict):
+            return {k: _truncate(v, max_len) for k, v in obj.items()}
+    except Exception:
+        pass
+    return obj
 
 def _emit_to_stream(kind: str, content: Any):
+    """스레드/쓰레드풀 어디서든 안전하게 현재 스트림으로 이벤트 emit"""
     stream_id = _current_stream_id.get()
     if not stream_id:
         return
     try:
-        q = _get_queue(stream_id)
-        q.put_nowait({"type": kind, "content": _truncate(content, 2000), "ts": datetime.now().isoformat()})
+        loop = _get_loop(stream_id)
+        q = _get_main_queue(stream_id)
+        ev = {"type": kind, "content": _truncate(content, 2000), "ts": datetime.now().isoformat()}
+        loop.call_soon_threadsafe(q.put_nowait, ev)
     except Exception:
         pass
 
@@ -103,6 +175,54 @@ _sse_log_handler = _LogToSSEHandler()
 _sse_log_handler.setLevel(logging.INFO)
 _sse_log_handler.setFormatter(logging.Formatter("%(message)s"))
 
+# === (중요) LangChain/루트 로거에도 SSE 핸들러 부착/해제 (중복방지, 레벨 보정) ===
+_LANGCHAIN_LOGGERS = [
+    "langchain",
+    "langchain_core",
+    "langchain_community",
+]
+_ATTACHED_FLAG = "_sse_handler_attached"
+
+def _attach_global_sse_logging_handlers():
+    """루트/uvicorn/httpx + LangChain 계열 로거에 SSE 핸들러 부착(중복 방지)."""
+    targets = [
+        logging.getLogger(),                 # root
+        logging.getLogger("uvicorn"),
+        logging.getLogger("uvicorn.error"),
+        logging.getLogger("uvicorn.access"),
+        logging.getLogger("httpx"),
+    ] + [logging.getLogger(n) for n in _LANGCHAIN_LOGGERS]
+
+    for lg in targets:
+        if not getattr(lg, _ATTACHED_FLAG, False):
+            lg.addHandler(_sse_log_handler)
+            # LangChain verbose를 SSE로 보려면 최소 INFO 권장
+            try:
+                if lg.level in (logging.NOTSET,) or lg.level > logging.INFO:
+                    lg.setLevel(logging.INFO)
+            except Exception:
+                pass
+            # 상위 전파 유지
+            lg.propagate = True
+            setattr(lg, _ATTACHED_FLAG, True)
+
+def _detach_global_sse_logging_handlers():
+    """부착했던 로거들에서 SSE 핸들러 제거."""
+    targets = [
+        logging.getLogger(),
+        logging.getLogger("uvicorn"),
+        logging.getLogger("uvicorn.error"),
+        logging.getLogger("uvicorn.access"),
+        logging.getLogger("httpx"),
+    ] + [logging.getLogger(n) for n in _LANGCHAIN_LOGGERS]
+
+    for lg in targets:
+        with contextlib.suppress(Exception):
+            lg.removeHandler(_sse_log_handler)
+        if getattr(lg, _ATTACHED_FLAG, False):
+            with contextlib.suppress(Exception):
+                delattr(lg, _ATTACHED_FLAG)
+
 # (SSE) 라우터: /api/sse/agent/{stream_id}
 router = APIRouter(prefix="/api/sse", tags=["sse"])
 
@@ -110,21 +230,51 @@ router = APIRouter(prefix="/api/sse", tags=["sse"])
 async def sse_agent_stream(stream_id: str):
     return StreamingResponse(_sse_event_generator(stream_id), media_type="text/event-stream", status_code=status.HTTP_200_OK)
 
+# ─────────────────────────────────────────────────────────
+# ★ 터미널 로그(개행 단위) 캡처러
+# ─────────────────────────────────────────────────────────
+class TerminalLogCapture:
+    """
+    sys.stdout/sys.stderr를 개행 단위로 버퍼링해
+    프론트로 'terminal' 타입 SSE 이벤트를 보낸다.
+    """
+    def __init__(self, stream_id: str):
+        self.stream_id = stream_id
+        self.buffer = ""
+        self.loop = _get_loop(stream_id)
+        self.q = _get_main_queue(stream_id)
 
-def _truncate(obj: Any, max_len: int = 800) -> Any:
-    """긴 문자열을 로그용으로 안전하게 자르기"""
-    try:
-        if isinstance(obj, str):
-            return (obj[:max_len] + "…") if len(obj) > max_len else obj
-        if isinstance(obj, list):
-            return [_truncate(x, max_len) for x in obj]
-        if isinstance(obj, dict):
-            return {k: _truncate(v, max_len) for k, v in obj.items()}
-    except Exception:
-        pass
-    return obj
+    def write(self, text: str):
+        if not text:
+            return
+        self.buffer += text
+        while "\n" in self.buffer:
+            line, self.buffer = self.buffer.split("\n", 1)
+            line = line.rstrip()
+            if not line:
+                continue
+            msg = {"type": "terminal", "content": line, "ts": datetime.now().isoformat()}
+            try:
+                self.loop.call_soon_threadsafe(self.q.put_nowait, msg)
+            except Exception as e:
+                # 마지막 수단으로 stderr에 경고
+                try:
+                    sys.__stderr__.write(f"[WARN] TerminalLogCapture emit failed: {e}\n")
+                except Exception:
+                    pass
 
+    def flush(self):
+        if self.buffer.strip():
+            msg = {"type": "terminal", "content": self.buffer.strip(), "ts": datetime.now().isoformat()}
+            try:
+                self.loop.call_soon_threadsafe(self.q.put_nowait, msg)
+            except Exception:
+                pass
+            self.buffer = ""
 
+# ─────────────────────────────────────────────────────────
+# JSON/파싱 유틸
+# ─────────────────────────────────────────────────────────
 def _extract_json_block(agent_result: Any) -> Dict[str, Any]:
     """툴 Observation에서 JSON 객체를 최대한 안전하게 추출."""
     try:
@@ -142,15 +292,12 @@ def _extract_json_block(agent_result: Any) -> Dict[str, Any]:
         pass
     return {}
 
-
 def _extract_phishing_from_judgement(obj: Dict[str, Any]) -> bool:
     return bool(obj.get("phishing"))
-
 
 def _extract_reason_from_judgement(obj: Dict[str, Any]) -> str:
     # reason 우선, 없으면 evidence 사용
     return (obj.get("reason") or obj.get("evidence") or "").strip()
-
 
 def _extract_guidance_text(agent_result: Any) -> str:
     """pick_guidance Observation에서 text 회수"""
@@ -174,7 +321,6 @@ def _extract_guidance_text(agent_result: Any) -> str:
     m2 = re.search(r"text['\"]\s*:\s*['\"]([^'\"]+)['\"]", str(agent_result))
     return m2.group(1).strip() if m2 else ""
 
-
 def _safe_json(obj: Any) -> Dict[str, Any]:
     """dict면 그대로, 정확한 JSON 문자열이면 json.loads, 아니면 빈 dict."""
     if isinstance(obj, dict):
@@ -186,7 +332,6 @@ def _safe_json(obj: Any) -> Dict[str, Any]:
     except Exception:
         pass
     return {}
-
 
 def _loose_parse_json(obj: Any) -> Dict[str, Any]:
     """JSON이 아니어도, python dict literal 문자열(작은따옴표) 등 느슨하게 파싱."""
@@ -220,13 +365,11 @@ def _loose_parse_json(obj: Any) -> Dict[str, Any]:
             pass
     return {}
 
-
 def _last_observation(cap: "ThoughtCapture", tool_name: str) -> Any:
     for ev in reversed(cap.events):
         if ev.get("type") == "observation" and ev.get("tool") == tool_name:
             return ev.get("output")
     return None
-
 
 # ★ 추가: dict 보장(모델/dict/TypedDict까지 deep copy)
 def _as_dict(x):
@@ -234,7 +377,6 @@ def _as_dict(x):
     if hasattr(x, "model_dump"):
         return x.model_dump()
     return copy.deepcopy(x)
-
 
 # ★ 추가: guidance 정규화(문자열 방지, 키 통일, 값 검증)
 def _normalize_guidance(g: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -254,7 +396,6 @@ def _normalize_guidance(g: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]
         raise HTTPException(400, detail=f"guidance 값은 'P' 또는 'A' 여야 합니다. got={val}")
     return {EXPECT_GUIDANCE_KEY: val, "text": text}
 
-
 # ★ 추가: payload 클린( None 제거 / forbid 대비 허용키만 유지 )
 def _clean_payload(
     d: Dict[str, Any],
@@ -267,14 +408,12 @@ def _clean_payload(
         out = {k: v for k, v in out.items() if k in allowed_keys}
     return out
 
-
 # ★ 추가: mcp.simulator_run용 Action Input 생성기 (언랩/래핑 선택)
 def _make_action_input_for_mcp(payload: Dict[str, Any]) -> str:
     if EXPECT_MCP_DATA_WRAPPER:
         return json.dumps({"data": payload}, ensure_ascii=False)
     else:
         return json.dumps(payload, ensure_ascii=False)
-
 
 # ★ 추가: 래핑으로 넣어서 pydantic이 최상위 필드 missing이라 말할 때 탐지
 def _looks_like_missing_top_fields_error(err_obj: Dict[str, Any]) -> bool:
@@ -291,7 +430,6 @@ def _looks_like_missing_top_fields_error(err_obj: Dict[str, Any]) -> bool:
         return has_data_literal and miss_top
     except Exception:
         return False
-
 
 def _get_tool(executor: AgentExecutor, name: str):
     for t in executor.tools:
@@ -321,14 +459,12 @@ def _ensure_admincase(db: Session, case_id: str, scenario_json: Dict[str, Any]) 
             if not case.scenario:
                 case.scenario = scenario_json
             case.status = case.status or "running"
+            created = False
         db.flush()
         db.commit()
         logger.info("[AdminCase upsert] case_id=%s | created=%s", case_id, created)
     except Exception as e:
         logger.warning(f"[AdminCase upsert] failed: {e}")
-
-
-
 
 # ─────────────────────────────────────────────────────────
 # LangChain 콜백: Thought/Action/Observation 캡처
@@ -372,9 +508,8 @@ class ThoughtCapture(BaseCallbackHandler):
         # (SSE) 에이전트 종료 전달
         _emit_to_stream("agent_finish", {"log": getattr(finish, "log", "")})
 
-
 # ─────────────────────────────────────────────────────────
-# ReAct 시스템 프롬프트 (툴별 입력 규칙 명확화 + 종결 후 예방책 1회)
+# ReAct 시스템 프롬프트
 # ─────────────────────────────────────────────────────────
 REACT_SYS = (
     "당신은 보이스피싱 시뮬레이션 오케스트레이터입니다.\n"
@@ -489,7 +624,6 @@ def build_agent_and_tools(db: Session, use_tavily: bool) -> Tuple[AgentExecutor,
     )
     return ex, mcp_manager
 
-
 # ─────────────────────────────────────────────────────────
 # 메인 오케스트레이션
 # ─────────────────────────────────────────────────────────
@@ -497,440 +631,445 @@ def run_orchestrated(db: Session, payload: Dict[str, Any]) -> Dict[str, Any]:
     # (SSE) 스트림 컨텍스트 시작: 프론트가 전달한 stream_id 사용(없으면 내부 생성)
     stream_id = str(payload.get("stream_id") or uuid.uuid4())
     token = _current_stream_id.set(stream_id)
+
+    # (고급 SSE) 전역/외부 로거 핸들러 부착
     logger.addHandler(_sse_log_handler)
+    _attach_global_sse_logging_handlers()
+
+    # ✅ 터미널 로그를 개행 단위로 프론트에 내보내기 위해 stdout/stderr 리디렉션
+    cap_stdout = TerminalLogCapture(stream_id)
+    cap_stderr = TerminalLogCapture(stream_id)
+
     _emit_to_stream("run_start", {"stream_id": stream_id, "payload_hint": _truncate(payload, 400)})
 
-    req = SimulationStartRequest(**payload)
-    ex, mcp_manager = build_agent_and_tools(db, use_tavily=req.use_tavily)
-
-    cap = ThoughtCapture()
-    used_tools: List[str] = []
-    tavily_used = False
-    rounds_done = 0
-    case_id = ""
-
-    # ★ 누적용 컨테이너 (최종예방책 1회 생성을 위해)
-    guidance_history: List[Dict[str, Any]] = []
-    judgements_history: List[Dict[str, Any]] = []
-    turns_all: List[Dict[str, str]] = []
+    req = None
+    ex = None
+    mcp_manager = None
 
     try:
-        # 1) 프롬프트 패키지 (DB 조립)
-        pkg = build_prompt_package_from_payload(
-            db, req, tavily_result=None, is_first_run=True, skip_catalog_write=True
-        )
-        scenario = pkg["scenario"]
-        victim_profile = pkg["victim_profile"]
-        templates = pkg["templates"]
+        with contextlib.redirect_stdout(cap_stdout), contextlib.redirect_stderr(cap_stderr):
+            req = SimulationStartRequest(**payload)
+            ex, mcp_manager = build_agent_and_tools(db, use_tavily=req.use_tavily)
 
-        # 입력/패키지 스냅샷
-        logger.info("[InitialInput] %s", json.dumps(_truncate(payload), ensure_ascii=False))
-        logger.info("[ComposedPromptPackage] %s", json.dumps(_truncate(pkg), ensure_ascii=False))
+            cap = ThoughtCapture()
+            used_tools: List[str] = []
+            tavily_used = False
+            rounds_done = 0
+            case_id = ""
 
-        offender_id = int(req.offender_id or 0)
-        victim_id = int(req.victim_id or 0)
-        # max_rounds = max(2, min(req.round_limit or 4, 5))  # 2~5
-        max_rounds = 1
+            # ★ 누적용 컨테이너 (최종예방책 1회 생성을 위해)
+            guidance_history: List[Dict[str, Any]] = []
+            judgements_history: List[Dict[str, Any]] = []
+            turns_all: List[Dict[str, str]] = []
 
-        guidance_kind: Optional[str] = None
-        guidance_text: Optional[str] = None
+            # 1) 프롬프트 패키지 (DB 조립)
+            pkg = build_prompt_package_from_payload(
+                db, req, tavily_result=None, is_first_run=True, skip_catalog_write=True
+            )
+            scenario = pkg["scenario"]
+            victim_profile = pkg["victim_profile"]
+            templates = pkg["templates"]
 
-        # dict 보장
-        scenario_base = _as_dict(scenario)
-        victim_profile_base = _as_dict(victim_profile)
-        templates_base = _as_dict(templates)
+            # 입력/패키지 스냅샷
+            logger.info("[InitialInput] %s", json.dumps(_truncate(payload), ensure_ascii=False))
+            logger.info("[ComposedPromptPackage] %s", json.dumps(_truncate(pkg), ensure_ascii=False))
 
-        base_payload: Dict[str, Any] = {
-            "offender_id": offender_id,
-            "victim_id": victim_id,
-            "scenario": scenario_base,
-            "victim_profile": victim_profile_base,
-            "templates": templates_base,  # 스키마에 없다면 allowed_keys에서 제거
-            "max_turns": req.max_turns,
-        }
+            offender_id = int(req.offender_id or 0)
+            victim_id = int(req.victim_id or 0)
+            # max_rounds = max(2, min(req.round_limit or 4, 5))  # 2~5
+            max_rounds = 1
 
-        for round_no in range(1, max_rounds + 1):
-            # ---- (A) 시뮬레이션 실행 ----
-            sim_payload: Dict[str, Any] = dict(base_payload)
+            guidance_kind: Optional[str] = None
+            guidance_text: Optional[str] = None
 
-            if round_no >= 2:
-                if not case_id:
-                    logger.error("round>=2 인데 case_id가 없습니다. 라운드1 결과 저장/파싱 확인 요망.")
-                    raise HTTPException(status_code=500, detail="missing case_id for subsequent rounds")
-                sim_payload.update({
-                    "case_id_override": case_id,
-                    "round_no": round_no,
-                })
-                if guidance_kind and guidance_text:
-                    normalized = _normalize_guidance({"type": guidance_kind, "text": guidance_text})
-                    sim_payload["guidance"] = normalized
-                    # ★ 실제 적용된 지침(해당 라운드 번호)에 대해서만 히스토리 기록
-                    guidance_history.append({
-                        "run_no": round_no,
-                        "kind": normalized.get(EXPECT_GUIDANCE_KEY),
-                        "text": normalized.get("text", "")
+            # dict 보장
+            scenario_base = _as_dict(scenario)
+            victim_profile_base = _as_dict(victim_profile)
+            templates_base = _as_dict(templates)
+
+            base_payload: Dict[str, Any] = {
+                "offender_id": offender_id,
+                "victim_id": victim_id,
+                "scenario": scenario_base,
+                "victim_profile": victim_profile_base,
+                "templates": templates_base,  # 스키마에 없다면 allowed_keys에서 제거
+                "max_turns": req.max_turns,
+            }
+
+            for round_no in range(1, max_rounds + 1):
+                # ---- (A) 시뮬레이션 실행 ----
+                sim_payload: Dict[str, Any] = dict(base_payload)
+
+                if round_no >= 2:
+                    if not case_id:
+                        logger.error("round>=2 인데 case_id가 없습니다. 라운드1 결과 저장/파싱 확인 요망.")
+                        raise HTTPException(status_code=500, detail="missing case_id for subsequent rounds")
+                    sim_payload.update({
+                        "case_id_override": case_id,
+                        "round_no": round_no,
                     })
-
-            # forbid 대비: 허용키만 유지 + None 제거
-            allowed_keys = [
-                "offender_id","victim_id","scenario","victim_profile","templates","max_turns",
-                "case_id_override","round_no","guidance"
-            ]
-            sim_payload = _clean_payload(sim_payload, allow_extras=False, allowed_keys=allowed_keys)
-
-            # 스냅샷 로그
-            snapshot = {
-                "round_no": round_no,
-                "offender_id": sim_payload.get("offender_id"),
-                "victim_id": sim_payload.get("victim_id"),
-                "case_id_override": sim_payload.get("case_id_override"),
-                "round_no_field": sim_payload.get("round_no"),
-                "guidance": sim_payload.get("guidance"),
-                "scenario": sim_payload.get("scenario"),
-                "victim_profile": sim_payload.get("victim_profile"),
-                "templates": {
-                    "attacker": sim_payload.get("templates", {}).get("attacker", ""),
-                    "victim": sim_payload.get("templates", {}).get("victim", ""),
-                } if "templates" in sim_payload else {},
-                "max_turns": sim_payload.get("max_turns"),
-            }
-            logger.info("[PromptSnapshot] %s", json.dumps(_truncate(snapshot), ensure_ascii=False))
-
-            # 필수키 점검
-            required = ["offender_id","victim_id","scenario","victim_profile","max_turns"]
-            missing = [k for k in required if k not in sim_payload]
-            if missing:
-                logger.error("[mcp.simulator_run] missing base keys: %s | sim_payload=%s",
-                            missing, json.dumps(sim_payload, ensure_ascii=False)[:800])
-                raise HTTPException(status_code=500, detail=f"sim payload missing: {missing}")
-
-            # ====== mcp.simulator_run 호출 (언랩 우선) ======
-            def _parsed_agent_input(x):
-                from json import JSONDecoder
-                if isinstance(x, str):
-                    try:
-                        return JSONDecoder().raw_decode(x.strip())[0]
-                    except Exception:
-                        return x
-                return x
-
-            def _invoke_mcp_simulator_via_agent(action_input: str):
-                llm_call = {
-                    "input": (
-                        "아래 JSON이 **Action Input 전체**다. 이 JSON을 그대로 사용하고, "
-                        "추가/변형 금지. 반드시 아래 JSON 한 줄만 출력하라.\n"
-                        "Action: mcp.simulator_run\n"
-                        f"Action Input: {action_input}"
-                    )
-                }
-                res = ex.invoke(llm_call, callbacks=[cap])
-                used_tools.append("mcp.simulator_run")
-                return res
-
-            # 언랩/래핑 설정에 맞춰 Action Input 생성
-            action_input_json = _make_action_input_for_mcp(sim_payload)
-
-            # 1차 호출 (에이전트 경유)
-            res_run = _invoke_mcp_simulator_via_agent(action_input_json)
-
-            # 도구 입력 불일치시 1회 재시도(그대로 다시)
-            if cap.last_tool == "mcp.simulator_run":
-                try:
-                    agent_input = _parsed_agent_input(cap.last_tool_input)
-                    intended = json.loads(action_input_json)
-                    if agent_input != intended:
-                        logger.warning(
-                            "[ToolInputMismatch] intended!=actual | intended=%s | actual=%s",
-                            json.dumps(_truncate(intended), ensure_ascii=False),
-                            json.dumps(_truncate(agent_input), ensure_ascii=False),
-                        )
-                        res_run = _invoke_mcp_simulator_via_agent(action_input_json)
-                        used_tools.append("mcp.simulator_run(retry)")
-                except Exception as e:
-                    logger.warning("[ToolInputCheckError] %s", e)
-
-            # Observation 파싱
-            # Observation 파싱
-            sim_obs = _last_observation(cap, "mcp.simulator_run")
-            sim_dict = _loose_parse_json(sim_obs)
-
-            # (1) 휴리스틱 기반 1차 폴백: agent가 data로 감쌌거나 top-level missing이면 언랩 직접 호출
-            bad_top = _looks_like_missing_top_fields_error(sim_dict)
-            sent_wrapped = (cap.last_tool_input == {"data": sim_payload})
-            if (not sim_dict.get("ok") and bad_top) or sent_wrapped:
-                logger.warning("[MCPFallback] agent가 data 래핑 또는 top-level missing → 툴 직접 호출(언랩)")
-                tool = _get_tool(ex, "mcp.simulator_run")
-                if not tool:
-                    raise HTTPException(500, detail="mcp.simulator_run tool not found")
-                tool_res = tool.invoke(sim_payload)  # 언랩 직접 호출
-                sim_dict = _loose_parse_json(tool_res)
-
-            # (2) 여전히 실패면, '반대 형태'로 무조건 1회 더 시도(래핑 ↔ 언랩 스위치)
-            if not sim_dict.get("ok"):
-                _emit_to_stream("debug", {"where": "mcp.simulator_run", "hint": "first_shape_failed_try_opposite"})
-                tool = _get_tool(ex, "mcp.simulator_run")
-                if not tool:
-                    raise HTTPException(500, detail="mcp.simulator_run tool not found")
-
-                try:
-                    # EXPECT_MCP_DATA_WRAPPER 기준의 '반대' 형태로 재시도
-                    if EXPECT_MCP_DATA_WRAPPER:
-                        # 현재 기본이 래핑이라면 → 언랩으로 재시도
-                        tool_res2 = tool.invoke(_clean_payload(sim_payload, allow_extras=False, allowed_keys=list(sim_payload.keys())))
-                    else:
-                        # 현재 기본이 언랩이라면 → 래핑으로 재시도
-                        tool_res2 = tool.invoke({"data": sim_payload})
-
-                    sim_dict2 = _loose_parse_json(tool_res2)
-
-                    # 어떤 결과든 SSE로도 노출
-                    _emit_to_stream("tool_observation", {"tool": "mcp.simulator_run(retry-opposite)", "output": _truncate(sim_dict2, 1000)})
-
-                    if sim_dict2.get("ok"):
-                        sim_dict = sim_dict2
-                    else:
-                        _emit_to_stream("debug", {
-                            "where": "mcp.simulator_run",
-                            "retry_opposite_failed": True,
-                            "first_shape": "wrapped" if EXPECT_MCP_DATA_WRAPPER else "unwrapped",
-                            "second_shape": "unwrapped" if EXPECT_MCP_DATA_WRAPPER else "wrapped",
-                            "err_first": _truncate(sim_dict, 800),
-                            "err_second": _truncate(sim_dict2, 800),
+                    if guidance_kind and guidance_text:
+                        normalized = _normalize_guidance({"type": guidance_kind, "text": guidance_text})
+                        sim_payload["guidance"] = normalized
+                        # ★ 실제 적용된 지침(해당 라운드 번호)에 대해서만 히스토리 기록
+                        guidance_history.append({
+                            "run_no": round_no,
+                            "kind": normalized.get(EXPECT_GUIDANCE_KEY),
+                            "text": normalized.get("text", "")
                         })
-                except Exception as e:
-                    _emit_to_stream("debug", {"where": "mcp.simulator_run", "retry_opposite_exception": str(e)})
 
-            # 최종 실패 처리
-            if not sim_dict.get("ok"):
-                logger.error(
-                    "[SimulatorRunFail] error=%s | payload=%s",
-                    _truncate(sim_dict, 800),
-                    json.dumps(sim_payload, ensure_ascii=False),
-                )
-                _emit_to_stream("error", {"where": "mcp.simulator_run", "error": _truncate(sim_dict, 800)})
-                raise HTTPException(status_code=500, detail=f"simulator_run failed: {sim_dict.get('error') or 'unknown'}")
+                # forbid 대비: 허용키만 유지 + None 제거
+                allowed_keys = [
+                    "offender_id","victim_id","scenario","victim_profile","templates","max_turns",
+                    "case_id_override","round_no","guidance"
+                ]
+                sim_payload = _clean_payload(sim_payload, allow_extras=False, allowed_keys=allowed_keys)
 
-
-            # case_id 확정/검증
-            if round_no == 1:
-                case_id = str(sim_dict.get("case_id") or "")
-                if not case_id:
-                    logger.error("[CaseID] 라운드1 case_id 추출 실패 | obs=%s", _truncate(sim_dict))
-                    raise HTTPException(status_code=500, detail="case_id 추출 실패(라운드1)")
-                _ensure_admincase(db, case_id, scenario_base)
-            else:
-                got = str(sim_dict.get("case_id") or "")
-                if got and got != case_id:
-                    logger.warning("[CaseID] 이어달리기 불일치 감지: expected=%s, got=%s", case_id, got)
-
-            rounds_done += 1
-
-            # 판정용 turns 확보 및 누적
-            turns = sim_dict.get("turns") or (sim_dict.get("log") or {}).get("turns") or []
-            ended_by = sim_dict.get("ended_by")
-            stats = sim_dict.get("stats") or {}
-            from app.db import models as m
-            try:
-                round_row = (
-                    db.query(m.ConversationRound)
-                    .filter(m.ConversationRound.case_id == case_id,
-                            m.ConversationRound.run == round_no)
-                    .first()
-                )
-                if not round_row:
-                    round_row = m.ConversationRound(
-                        case_id=case_id,
-                        run=round_no,
-                        offender_id=offender_id,
-                        victim_id=victim_id,
-                        turns=turns,
-                        ended_by=ended_by,
-                        stats=stats,
-                    )
-                    db.add(round_row)
-                else:
-                    round_row.turns = turns
-                    round_row.ended_by = ended_by
-                    round_row.stats = stats
-
-                db.commit()
-            except Exception as e:
-                logger.warning(f"[DB] save conversation_round failed: {e}")
-            logger.info("[SIM] case_id=%s turns=%s ended_by=%s",
-                        sim_dict.get("case_id"), len(turns), sim_dict.get("ended_by"))
-            if isinstance(turns, list):
-                turns_all.extend(turns)
-
-            # ── (B) 판정 생성: 방금 턴으로 직접 판단 ──
-            make_payload = {
-                "data": {
-                    "case_id": case_id,
-                    "run_no": round_no,
-                    "turns": turns
+                # 스냅샷 로그
+                snapshot = {
+                    "round_no": round_no,
+                    "offender_id": sim_payload.get("offender_id"),
+                    "victim_id": sim_payload.get("victim_id"),
+                    "case_id_override": sim_payload.get("case_id_override"),
+                    "round_no_field": sim_payload.get("round_no"),
+                    "guidance": sim_payload.get("guidance"),
+                    "scenario": sim_payload.get("scenario"),
+                    "victim_profile": sim_payload.get("victim_profile"),
+                    "templates": {
+                        "attacker": sim_payload.get("templates", {}).get("attacker", ""),
+                        "victim": sim_payload.get("templates", {}).get("victim", ""),
+                    } if "templates" in sim_payload else {},
+                    "max_turns": sim_payload.get("max_turns"),
                 }
-            }
-            res_make = ex.invoke(
-                {"input": "admin.make_judgement 호출.\n" + json.dumps(make_payload, ensure_ascii=False)},
-                callbacks=[cap],
-            )
-            used_tools.append("admin.make_judgement")
+                logger.info("[PromptSnapshot] %s", json.dumps(_truncate(snapshot), ensure_ascii=False))
 
-            judge_obs = _last_observation(cap, "admin.make_judgement")
-            judgement = _loose_parse_json(judge_obs) or _loose_parse_json(res_make)
-            if not judgement:
-                for ev in reversed(cap.events):
-                    if ev.get("type") == "observation":
-                        cand = _loose_parse_json(ev.get("output"))
-                        if isinstance(cand, dict) and ("phishing" in cand or "risk" in cand):
-                            judgement = cand
-                            break
-            if not judgement:
-                logger.error(
-                    "[JudgementParse] 판정 JSON 추출 실패 | obs=%s | res=%s",
-                    _truncate(judge_obs),
-                    _truncate(res_make),
-                )
-                raise HTTPException(status_code=500, detail="판정 JSON 추출 실패(admin.make_judgement)")
+                # 필수키 점검
+                required = ["offender_id","victim_id","scenario","victim_profile","max_turns"]
+                missing = [k for k in required if k not in sim_payload]
+                if missing:
+                    logger.error("[mcp.simulator_run] missing base keys: %s | sim_payload=%s",
+                                missing, json.dumps(sim_payload, ensure_ascii=False)[:800])
+                    raise HTTPException(status_code=500, detail=f"sim payload missing: {missing}")
 
-            phishing = _extract_phishing_from_judgement(judgement)
-            reason = _extract_reason_from_judgement(judgement)
-            risk_obj = judgement.get("risk") or {}
-            risk_lvl = (risk_obj.get("level") or "").lower()  # low|medium|high|critical
-            risk_scr = int(risk_obj.get("score") or 0)
-            cont_obj = judgement.get("continue") or {}
-            cont_rec = (cont_obj.get("recommendation") or "").lower()  # continue|stop
-            cont_msg = cont_obj.get("reason") or ""
+                # ====== mcp.simulator_run 호출 (언랩 우선) ======
+                def _parsed_agent_input(x):
+                    from json import JSONDecoder
+                    if isinstance(x, str):
+                        try:
+                            return JSONDecoder().raw_decode(x.strip())[0]
+                        except Exception:
+                            return x
+                    return x
 
-            logger.info(
-                "[Judgement] round=%s | phishing=%s | risk=%s(%s) | continue=%s (%s)",
-                round_no, phishing, risk_lvl, risk_scr, cont_rec, _truncate(cont_msg, 200),
-            )
-
-            # ── (B-2) 판정 히스토리 누적 ──
-            judgements_history.append({
-                "run_no": round_no,
-                "phishing": phishing,
-                "risk": risk_obj,
-                "evidence": judgement.get("evidence") or reason
-            })
-
-            # ── (C) 다음 라운드를 위한 지침 선택 ──
-            if round_no < max_rounds:
-                guidance_kind = "P" if phishing else "A"
-                logger.info("[GuidanceKind] round=%s | phishing=%s → kind=%s", round_no, phishing, guidance_kind)
-
-                pick_payload = {"data": {"kind": guidance_kind}}
-                res_pick = ex.invoke(
-                    {
+                def _invoke_mcp_simulator_via_agent(action_input: str):
+                    llm_call = {
                         "input": (
-                            "아래 JSON을 **수정하지 말고 그대로** admin.pick_guidance의 Action Input으로 사용하라.\n"
-                            "DO NOT MODIFY. USE EXACTLY AS-IS.\n"
-                            + json.dumps(pick_payload, ensure_ascii=False)
+                            "아래 JSON이 **Action Input 전체**다. 이 JSON을 그대로 사용하고, "
+                            "추가/변형 금지. 반드시 아래 JSON 한 줄만 출력하라.\n"
+                            "Action: mcp.simulator_run\n"
+                            f"Action Input: {action_input}"
                         )
-                    },
+                    }
+                    res = ex.invoke(llm_call, callbacks=[cap])
+                    used_tools.append("mcp.simulator_run")
+                    return res
+
+                # 언랩/래핑 설정에 맞춰 Action Input 생성
+                action_input_json = _make_action_input_for_mcp(sim_payload)
+
+                # 1차 호출 (에이전트 경유)
+                res_run = _invoke_mcp_simulator_via_agent(action_input_json)
+
+                # 도구 입력 불일치시 1회 재시도(그대로 다시)
+                if cap.last_tool == "mcp.simulator_run":
+                    try:
+                        agent_input = _parsed_agent_input(cap.last_tool_input)
+                        intended = json.loads(action_input_json)
+                        if agent_input != intended:
+                            logger.warning(
+                                "[ToolInputMismatch] intended!=actual | intended=%s | actual=%s",
+                                json.dumps(_truncate(intended), ensure_ascii=False),
+                                json.dumps(_truncate(agent_input), ensure_ascii=False),
+                            )
+                            res_run = _invoke_mcp_simulator_via_agent(action_input_json)
+                            used_tools.append("mcp.simulator_run(retry)")
+                    except Exception as e:
+                        logger.warning("[ToolInputCheckError] %s", e)
+
+                # Observation 파싱
+                sim_obs = _last_observation(cap, "mcp.simulator_run")
+                sim_dict = _loose_parse_json(sim_obs)
+
+                # (1) 휴리스틱 기반 1차 폴백: agent가 data로 감쌌거나 top-level missing이면 언랩 직접 호출
+                bad_top = _looks_like_missing_top_fields_error(sim_dict)
+                sent_wrapped = (cap.last_tool_input == {"data": sim_payload})
+                if (not sim_dict.get("ok") and bad_top) or sent_wrapped:
+                    logger.warning("[MCPFallback] agent가 data 래핑 또는 top-level missing → 툴 직접 호출(언랩)")
+                    tool = _get_tool(ex, "mcp.simulator_run")
+                    if not tool:
+                        raise HTTPException(500, detail="mcp.simulator_run tool not found")
+                    tool_res = tool.invoke(sim_payload)  # 언랩 직접 호출
+                    sim_dict = _loose_parse_json(tool_res)
+
+                # (2) 여전히 실패면, '반대 형태'로 무조건 1회 더 시도(래핑 ↔ 언랩 스위치)
+                if not sim_dict.get("ok"):
+                    _emit_to_stream("debug", {"where": "mcp.simulator_run", "hint": "first_shape_failed_try_opposite"})
+                    tool = _get_tool(ex, "mcp.simulator_run")
+                    if not tool:
+                        raise HTTPException(500, detail="mcp.simulator_run tool not found")
+
+                    try:
+                        # EXPECT_MCP_DATA_WRAPPER 기준의 '반대' 형태로 재시도
+                        if EXPECT_MCP_DATA_WRAPPER:
+                            tool_res2 = tool.invoke(_clean_payload(sim_payload, allow_extras=False, allowed_keys=list(sim_payload.keys())))
+                        else:
+                            tool_res2 = tool.invoke({"data": sim_payload})
+
+                        sim_dict2 = _loose_parse_json(tool_res2)
+
+                        # 어떤 결과든 SSE로도 노출
+                        _emit_to_stream("tool_observation", {"tool": "mcp.simulator_run(retry-opposite)", "output": _truncate(sim_dict2, 1000)})
+
+                        if sim_dict2.get("ok"):
+                            sim_dict = sim_dict2
+                        else:
+                            _emit_to_stream("debug", {
+                                "where": "mcp.simulator_run",
+                                "retry_opposite_failed": True,
+                                "first_shape": "wrapped" if EXPECT_MCP_DATA_WRAPPER else "unwrapped",
+                                "second_shape": "unwrapped" if EXPECT_MCP_DATA_WRAPPER else "wrapped",
+                                "err_first": _truncate(sim_dict, 800),
+                                "err_second": _truncate(sim_dict2, 800),
+                            })
+                    except Exception as e:
+                        _emit_to_stream("debug", {"where": "mcp.simulator_run", "retry_opposite_exception": str(e)})
+
+                # 최종 실패 처리
+                if not sim_dict.get("ok"):
+                    logger.error(
+                        "[SimulatorRunFail] error=%s | payload=%s",
+                        _truncate(sim_dict, 800),
+                        json.dumps(sim_payload, ensure_ascii=False),
+                    )
+                    _emit_to_stream("error", {"where": "mcp.simulator_run", "error": _truncate(sim_dict, 800)})
+                    raise HTTPException(status_code=500, detail=f"simulator_run failed: {sim_dict.get('error') or 'unknown'}")
+
+                # case_id 확정/검증
+                if round_no == 1:
+                    case_id = str(sim_dict.get("case_id") or "")
+                    if not case_id:
+                        logger.error("[CaseID] 라운드1 case_id 추출 실패 | obs=%s", _truncate(sim_dict))
+                        raise HTTPException(status_code=500, detail="case_id 추출 실패(라운드1)")
+                    _ensure_admincase(db, case_id, scenario_base)
+                else:
+                    got = str(sim_dict.get("case_id") or "")
+                    if got and got != case_id:
+                        logger.warning("[CaseID] 이어달리기 불일치 감지: expected=%s, got=%s", case_id, got)
+
+                rounds_done += 1
+
+                # 판정용 turns 확보 및 누적
+                turns = sim_dict.get("turns") or (sim_dict.get("log") or {}).get("turns") or []
+                ended_by = sim_dict.get("ended_by")
+                stats = sim_dict.get("stats") or {}
+                try:
+                    round_row = (
+                        db.query(m.ConversationRound)
+                        .filter(m.ConversationRound.case_id == case_id,
+                                m.ConversationRound.run == round_no)
+                        .first()
+                    )
+                    if not round_row:
+                        round_row = m.ConversationRound(
+                            case_id=case_id,
+                            run=round_no,
+                            offender_id=offender_id,
+                            victim_id=victim_id,
+                            turns=turns,
+                            ended_by=ended_by,
+                            stats=stats,
+                        )
+                        db.add(round_row)
+                    else:
+                        round_row.turns = turns
+                        round_row.ended_by = ended_by
+                        round_row.stats = stats
+
+                    db.commit()
+                except Exception as e:
+                    logger.warning(f"[DB] save conversation_round failed: {e}")
+                logger.info("[SIM] case_id=%s turns=%s ended_by=%s",
+                            sim_dict.get("case_id"), len(turns), sim_dict.get("ended_by"))
+                if isinstance(turns, list):
+                    turns_all.extend(turns)
+
+                # ── (B) 판정 생성 ──
+                make_payload = {
+                    "data": {
+                        "case_id": case_id,
+                        "run_no": round_no,
+                        "turns": turns
+                    }
+                }
+                res_make = ex.invoke(
+                    {"input": "admin.make_judgement 호출.\n" + json.dumps(make_payload, ensure_ascii=False)},
                     callbacks=[cap],
                 )
-                used_tools.append("admin.pick_guidance")
+                used_tools.append("admin.make_judgement")
 
-                # Observation 기반으로 지침 텍스트 뽑기 (다음 라운드 적용 예정)
-                pick_obs = _last_observation(cap, "admin.pick_guidance")
-                guidance_text = _extract_guidance_text(pick_obs) or _extract_guidance_text(res_pick) or "기본 예방 수칙을 따르세요."
-                logger.info("[GuidancePicked] round=%s | kind=%s | text=%s", round_no, guidance_kind, _truncate(guidance_text, 300))
+                judge_obs = _last_observation(cap, "admin.make_judgement")
+                judgement = _loose_parse_json(judge_obs) or _loose_parse_json(res_make)
+                if not judgement:
+                    for ev in reversed(cap.events):
+                        if ev.get("type") == "observation":
+                            cand = _loose_parse_json(ev.get("output"))
+                            if isinstance(cand, dict) and ("phishing" in cand or "risk" in cand):
+                                judgement = cand
+                                break
+                if not judgement:
+                    logger.error(
+                        "[JudgementParse] 판정 JSON 추출 실패 | obs=%s | res=%s",
+                        _truncate(judge_obs),
+                        _truncate(res_make),
+                    )
+                    raise HTTPException(status_code=500, detail="판정 JSON 추출 실패(admin.make_judgement)")
 
-            # ── (E) 종료 조건 ───────────────────────────────────
-            MIN_ROUNDS = 1
-            MAX_ROUNDS = 1
+                phishing = _extract_phishing_from_judgement(judgement)
+                reason = _extract_reason_from_judgement(judgement)
+                risk_obj = judgement.get("risk") or {}
+                risk_lvl = (risk_obj.get("level") or "").lower()  # low|medium|high|critical
+                risk_scr = int(risk_obj.get("score") or 0)
+                cont_obj = judgement.get("continue") or {}
+                cont_rec = (cont_obj.get("recommendation") or "").lower()  # continue|stop
+                cont_msg = cont_obj.get("reason") or ""
 
-            stop_on_critical = (risk_lvl == "critical") and (round_no >= MIN_ROUNDS)
-            hit_max_rounds   = (round_no >= MAX_ROUNDS)
-
-            if stop_on_critical or hit_max_rounds:
                 logger.info(
-                    "[StopCondition] 종료 | reason=%s | round=%s",
-                    ("critical" if stop_on_critical else "max_rounds"),
-                    round_no,
+                    "[Judgement] round=%s | phishing=%s | risk=%s(%s) | continue=%s (%s)",
+                    round_no, phishing, risk_lvl, risk_scr, cont_rec, _truncate(cont_msg, 200),
                 )
-                break
 
-        # ---- (F) 최종예방책: 모든 라운드 종료 후 단 한 번 호출 ----
-        prevention_payload = {
-            "data": {
-                "case_id": case_id,
-                "rounds": rounds_done,
-                "turns": turns_all,
-                "judgements": judgements_history,
-                "guidances": guidance_history,
-                "format": "personalized_prevention"
-            }
-        }
-        res_prev = ex.invoke(
-            {"input": "admin.make_prevention 호출.\n" + json.dumps(prevention_payload, ensure_ascii=False)},
-            callbacks=[cap],
-        )
-        used_tools.append("admin.make_prevention")
+                # ── (B-2) 판정 히스토리 누적 ──
+                judgements_history.append({
+                    "run_no": round_no,
+                    "phishing": phishing,
+                    "risk": risk_obj,
+                    "evidence": judgement.get("evidence") or reason
+                })
 
-        prev_obs = _last_observation(cap, "admin.make_prevention")
-        prev_dict = _loose_parse_json(prev_obs) or _loose_parse_json(res_prev)
-        if not prev_dict.get("ok"):
-            logger.error("[PreventionFail] obs=%s | res=%s", _truncate(prev_obs), _truncate(res_prev))
-            prevention_obj = {}
-        else:
-            prevention_obj = prev_dict.get("personalized_prevention") or {}
+                # ── (C) 다음 라운드를 위한 지침 선택 ──
+                if round_no < max_rounds:
+                    guidance_kind = "P" if phishing else "A"
+                    logger.info("[GuidanceKind] round=%s | phishing=%s | kind=%s", round_no, phishing, guidance_kind)
 
-        if prevention_obj:
-            summary = prevention_obj.get("summary", "")
-            steps = prevention_obj.get("steps", [])
-            save_payload = {
+                    pick_payload = {"data": {"kind": guidance_kind}}
+                    res_pick = ex.invoke(
+                        {
+                            "input": (
+                                "아래 JSON을 **수정하지 말고 그대로** admin.pick_guidance의 Action Input으로 사용하라.\n"
+                                "DO NOT MODIFY. USE EXACTLY AS-IS.\n"
+                                + json.dumps(pick_payload, ensure_ascii=False)
+                            )
+                        },
+                        callbacks=[cap],
+                    )
+                    used_tools.append("admin.pick_guidance")
+
+                    # Observation 기반으로 지침 텍스트 뽑기 (다음 라운드 적용 예정)
+                    pick_obs = _last_observation(cap, "admin.pick_guidance")
+                    guidance_text = _extract_guidance_text(pick_obs) or _extract_guidance_text(res_pick) or "기본 예방 수칙을 따르세요."
+                    logger.info("[GuidancePicked] round=%s | kind=%s | text=%s", round_no, guidance_kind, _truncate(guidance_text, 300))
+
+                # ── (E) 종료 조건 ───────────────────────────────────
+                MIN_ROUNDS = 1
+                MAX_ROUNDS = 1
+
+                stop_on_critical = (risk_lvl == "critical") and (round_no >= MIN_ROUNDS)
+                hit_max_rounds   = (round_no >= MAX_ROUNDS)
+
+                if stop_on_critical or hit_max_rounds:
+                    logger.info(
+                        "[StopCondition] 종료 | reason=%s | round=%s",
+                        ("critical" if stop_on_critical else "max_rounds"),
+                        round_no,
+                    )
+                    break
+
+            # ---- (F) 최종예방책: 모든 라운드 종료 후 단 한 번 호출 ----
+            prevention_payload = {
                 "data": {
                     "case_id": case_id,
-                    "offender_id": offender_id,
-                    "victim_id": victim_id,
-                    "run_no": rounds_done,
-                    "summary": summary,
-                    "steps": steps
+                    "rounds": rounds_done,
+                    "turns": turns_all,
+                    "judgements": judgements_history,
+                    "guidances": guidance_history,
+                    "format": "personalized_prevention"
                 }
             }
-            res_save = ex.invoke(
-                {"input": "admin.save_prevention 호출.\n" + json.dumps(save_payload, ensure_ascii=False)},
+            res_prev = ex.invoke(
+                {"input": "admin.make_prevention 호출.\n" + json.dumps(prevention_payload, ensure_ascii=False)},
                 callbacks=[cap],
             )
-            used_tools.append("admin.save_prevention")
+            used_tools.append("admin.make_prevention")
 
-        return {
-            "status": "success",
-            "case_id": case_id,
-            "rounds": rounds_done,
-            "turns_per_round": req.max_turns,
-            "timestamp": datetime.now().isoformat(),
-            "used_tools": used_tools,
-            "mcp_used": True,
-            "tavily_used": tavily_used,
-            "personalized_prevention": prevention_obj,  # ★ 최종예방책 포함
-        }
+            prev_obs = _last_observation(cap, "admin.make_prevention")
+            prev_dict = _loose_parse_json(prev_obs) or _loose_parse_json(res_prev)
+            if not prev_dict.get("ok"):
+                logger.error("[PreventionFail] obs=%s | res=%s", _truncate(prev_obs), _truncate(res_prev))
+                prevention_obj = {}
+            else:
+                prevention_obj = prev_dict.get("personalized_prevention") or {}
+
+            if prevention_obj:
+                summary = prevention_obj.get("summary", "")
+                steps = prevention_obj.get("steps", [])
+                save_payload = {
+                    "data": {
+                        "case_id": case_id,
+                        "offender_id": offender_id,
+                        "victim_id": victim_id,
+                        "run_no": rounds_done,
+                        "summary": summary,
+                        "steps": steps
+                    }
+                }
+                res_save = ex.invoke(
+                    {"input": "admin.save_prevention 호출.\n" + json.dumps(save_payload, ensure_ascii=False)},
+                    callbacks=[cap],
+                )
+                used_tools.append("admin.save_prevention")
+
+            return {
+                "status": "success",
+                "case_id": case_id,
+                "rounds": rounds_done,
+                "turns_per_round": req.max_turns,
+                "timestamp": datetime.now().isoformat(),
+                "used_tools": used_tools,
+                "mcp_used": True,
+                "tavily_used": tavily_used,
+                "personalized_prevention": prevention_obj,  # ★ 최종예방책 포함
+            }
+
     finally:
+        # 남은 버퍼 강제 flush
+        with contextlib.suppress(Exception):
+            cap_stdout.flush()
+            cap_stderr.flush()
         # (SSE) run 종료 이벤트 + 정리
-        try:
+        with contextlib.suppress(Exception):
             _emit_to_stream("run_end", {"case_id": locals().get("case_id", ""), "rounds": locals().get("rounds_done", 0)})
-        except Exception:
-            pass
-        try:
+        with contextlib.suppress(Exception):
             _current_stream_id.reset(token)
-        except Exception:
-            pass
-        try:
+        with contextlib.suppress(Exception):
             logger.removeHandler(_sse_log_handler)
-        except Exception:
-            pass
-        try:
-            if mcp_manager and getattr(mcp_manager, "is_running", False):
+        # 외부 로거에서 SSE 핸들러 제거
+        _detach_global_sse_logging_handlers()
+        with contextlib.suppress(Exception):
+            if locals().get("mcp_manager") and getattr(mcp_manager, "is_running", False):
                 mcp_manager.stop_mcp_server()
-        except Exception:
-            pass
-
 
 # orchestrator_react.py 안에 추가
 # (import 는 파일 상단에 이미 있음: asyncio, uuid, Optional, AsyncGenerator 등)
-
 async def run_orchestrated_stream(db: Session, payload: Dict[str, Any]):
     """
     라우터에서 직접 호출하는 SSE 제너레이터.
@@ -938,27 +1077,31 @@ async def run_orchestrated_stream(db: Session, payload: Dict[str, Any]):
       text/event-stream 포맷으로 감싸 전송함.
     - 기존 run_orchestrated()를 백그라운드에서 돌리고,
       이 파일의 logger/콜백에서 나오는 로그를 큐를 통해 실시간으로 전달.
+    - (고급) 외부 구독자(sinks)에서 오는 이벤트도 합류(fan-in).
     """
-    # 1) 이 스트림 전용 stream_id와 큐 준비
+    # 메인 스트림 상태 확보(루프/큐/구독자)
     stream_id = str(payload.get("stream_id") or uuid.uuid4())
-    q = _get_queue(stream_id)
+    _ensure_stream(stream_id)
+    main_q = _get_main_queue(stream_id)
 
-    # 2) run_orchestrated를 쓰레드에서 동기 실행
+    # run_orchestrated 동기함수 → 별도 스레드로 실행
     async def _runner():
         try:
-            # run_orchestrated는 동기함수이므로 to_thread로 실행
             res = await asyncio.to_thread(run_orchestrated, db, {**payload, "stream_id": stream_id})
             # 최종 결과도 하나 더 흘려주면 프론트에서 편함
-            _emit_to_stream("result", res)
+            ev = {"type": "result", "content": res, "ts": datetime.now().isoformat()}
+            loop = _get_loop(stream_id)
+            loop.call_soon_threadsafe(main_q.put_nowait, ev)
         except Exception as e:
-            _emit_to_stream("error", {"message": str(e)})
+            loop = _get_loop(stream_id)
+            loop.call_soon_threadsafe(main_q.put_nowait, {"type": "error", "message": str(e)})
 
     task = asyncio.create_task(_runner())
 
     try:
-        # 3) 큐에서 이벤트를 하나씩 꺼내 제너레이터로 내보냄
+        # 메인 큐에서 이벤트를 하나씩 꺼내 제너레이터로 내보냄
         while True:
-            ev = await q.get()
+            ev = await main_q.get()
             # 라우터 쪽에서 event/data로 감쌀 것이므로 dict 그대로 yield
             yield ev
 
@@ -969,13 +1112,9 @@ async def run_orchestrated_stream(db: Session, payload: Dict[str, Any]):
 
             # 컨텍스트 스위치 (긴 연산 중 다른 코루틴에 양보)
             await asyncio.sleep(0)
-
     finally:
-        # 4) 정리: 큐 제거 + 태스크 안전 종료
-        try:
-            _SSE_QUEUES.pop(stream_id, None)
-        except Exception:
-            pass
+        # 정리: 스트림 상태 제거 + 태스크 안전 종료
+        _STREAMS.pop(stream_id, None)
         if not task.done():
             task.cancel()
             with contextlib.suppress(Exception):

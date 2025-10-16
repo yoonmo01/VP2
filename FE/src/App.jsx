@@ -72,20 +72,15 @@ async function getConversationBundle(caseId) {
 
 // ✅ SSE 스트리밍
 export async function* streamReactSimulation(payload = {}) {
-  // 1) 쿼리스트링 구성 (GET은 body 사용 불가)
   const params = new URLSearchParams();
   Object.entries(payload).forEach(([k, v]) => {
     if (v !== undefined && v !== null) params.set(k, String(v));
   });
 
-  // 2) SSE URL 구성
   const base = typeof API_ROOT === "string" ? API_ROOT : "";
   const url = `${base}/react-agent/simulation/stream?${params.toString()}`;
-
-  // 3) EventSource로 연결
   const es = new EventSource(url);
 
-  // 4) async generator를 위한 간단 큐
   const queue = [];
   let notify;
   let done = false;
@@ -95,17 +90,17 @@ export async function* streamReactSimulation(payload = {}) {
     if (notify) { notify(); notify = undefined; }
   };
 
-  // (A) 기본 message 이벤트
   es.onmessage = (e) => {
     try { push(JSON.parse(e.data)); }
     catch { push(e.data); }
   };
 
-  // (B) 라우터가 보내는 커스텀 이벤트들 구독
   const eventTypes = [
     "run_start","log","agent_action","tool_observation","agent_finish",
-    "result","run_end","ping","error"
+    "result","run_end","ping","error",
+    "terminal" // ✅ 추가
   ];
+
   eventTypes.forEach((t) => {
     es.addEventListener(t, (e) => {
       try { push(JSON.parse(e.data)); }
@@ -117,7 +112,6 @@ export async function* streamReactSimulation(payload = {}) {
     });
   });
 
-  // (C) 네트워크/연결 에러
   es.addEventListener("error", (e) => {
     push({ type: "error", message: "SSE connection error" });
     done = true;
@@ -131,7 +125,7 @@ export async function* streamReactSimulation(payload = {}) {
       }
       while (queue.length) {
         const ev = queue.shift();
-        yield ev; // 기존 for-await 사용 그대로 가능
+        yield ev;
         if (ev?.type === "run_end" || ev?.type === "error") {
           done = true;
           es.close();
