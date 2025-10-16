@@ -231,15 +231,27 @@ async def sse_agent_stream(stream_id: str):
     return StreamingResponse(_sse_event_generator(stream_id), media_type="text/event-stream", status_code=status.HTTP_200_OK)
 
 # ─────────────────────────────────────────────────────────
-# ★ 터미널 로그(개행 단위) 캡처러
+# ★ 콘솔 스트림 보장 + Tee 터미널 (콘솔 + SSE 동시 출력)
 # ─────────────────────────────────────────────────────────
-class TerminalLogCapture:
+def _ensure_console_stream_handler():
+    """루트 로거에 콘솔 StreamHandler가 없다면 하나 추가 (중복 안전)."""
+    root = logging.getLogger()
+    if not any(isinstance(h, logging.StreamHandler) for h in root.handlers):
+        sh = logging.StreamHandler(sys.stdout)
+        sh.setLevel(logging.INFO)
+        sh.setFormatter(logging.Formatter("[%(levelname)s] %(asctime)s %(name)s: %(message)s"))
+        root.addHandler(sh)
+
+class TeeTerminal:
     """
-    sys.stdout/sys.stderr를 개행 단위로 버퍼링해
-    프론트로 'terminal' 타입 SSE 이벤트를 보낸다.
+    sys.stdout/sys.stderr를 Tee 방식으로 교체:
+    - 원본 콘솔(sys.__stdout__/__stderr__) 에 그대로 출력
+    - 동시에 현재 stream_id의 SSE main_q 로 'terminal' 이벤트 push
     """
-    def __init__(self, stream_id: str):
+    def __init__(self, stream_id: str, which: str = "stdout"):
         self.stream_id = stream_id
+        self.which = which  # "stdout" | "stderr"
+        self.orig = sys.__stdout__ if which == "stdout" else sys.__stderr__
         self.buffer = ""
         self.loop = _get_loop(stream_id)
         self.q = _get_main_queue(stream_id)
@@ -247,6 +259,14 @@ class TerminalLogCapture:
     def write(self, text: str):
         if not text:
             return
+        # 1) 원본 콘솔로 그대로 내보내기
+        try:
+            self.orig.write(text)
+            self.orig.flush()
+        except Exception:
+            pass
+
+        # 2) SSE 쪽으로는 개행 단위로 나눠서 보냄
         self.buffer += text
         while "\n" in self.buffer:
             line, self.buffer = self.buffer.split("\n", 1)
@@ -256,14 +276,12 @@ class TerminalLogCapture:
             msg = {"type": "terminal", "content": line, "ts": datetime.now().isoformat()}
             try:
                 self.loop.call_soon_threadsafe(self.q.put_nowait, msg)
-            except Exception as e:
-                # 마지막 수단으로 stderr에 경고
-                try:
-                    sys.__stderr__.write(f"[WARN] TerminalLogCapture emit failed: {e}\n")
-                except Exception:
-                    pass
+            except Exception:
+                # SSE 실패는 콘솔만 찍히게 무시
+                pass
 
     def flush(self):
+        # 남은 버퍼 한 번 더 SSE로 내보내기
         if self.buffer.strip():
             msg = {"type": "terminal", "content": self.buffer.strip(), "ts": datetime.now().isoformat()}
             try:
@@ -271,6 +289,11 @@ class TerminalLogCapture:
             except Exception:
                 pass
             self.buffer = ""
+        # 원본도 flush
+        try:
+            self.orig.flush()
+        except Exception:
+            pass
 
 # ─────────────────────────────────────────────────────────
 # JSON/파싱 유틸
@@ -636,9 +659,12 @@ def run_orchestrated(db: Session, payload: Dict[str, Any]) -> Dict[str, Any]:
     logger.addHandler(_sse_log_handler)
     _attach_global_sse_logging_handlers()
 
-    # ✅ 터미널 로그를 개행 단위로 프론트에 내보내기 위해 stdout/stderr 리디렉션
-    cap_stdout = TerminalLogCapture(stream_id)
-    cap_stderr = TerminalLogCapture(stream_id)
+    # 콘솔 스트림 보장(중복 안전)
+    _ensure_console_stream_handler()
+
+    # ✅ 터미널 Tee: 콘솔에도 찍고, SSE로도 보냄
+    tee_out = TeeTerminal(stream_id, "stdout")
+    tee_err = TeeTerminal(stream_id, "stderr")
 
     _emit_to_stream("run_start", {"stream_id": stream_id, "payload_hint": _truncate(payload, 400)})
 
@@ -647,7 +673,7 @@ def run_orchestrated(db: Session, payload: Dict[str, Any]) -> Dict[str, Any]:
     mcp_manager = None
 
     try:
-        with contextlib.redirect_stdout(cap_stdout), contextlib.redirect_stderr(cap_stderr):
+        with contextlib.redirect_stdout(tee_out), contextlib.redirect_stderr(tee_err):
             req = SimulationStartRequest(**payload)
             ex, mcp_manager = build_agent_and_tools(db, use_tavily=req.use_tavily)
 
@@ -1053,8 +1079,8 @@ def run_orchestrated(db: Session, payload: Dict[str, Any]) -> Dict[str, Any]:
     finally:
         # 남은 버퍼 강제 flush
         with contextlib.suppress(Exception):
-            cap_stdout.flush()
-            cap_stderr.flush()
+            tee_out.flush()
+            tee_err.flush()
         # (SSE) run 종료 이벤트 + 정리
         with contextlib.suppress(Exception):
             _emit_to_stream("run_end", {"case_id": locals().get("case_id", ""), "rounds": locals().get("rounds_done", 0)})
