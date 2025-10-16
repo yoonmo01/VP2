@@ -532,6 +532,65 @@ class ThoughtCapture(BaseCallbackHandler):
         _emit_to_stream("agent_finish", {"log": getattr(finish, "log", "")})
 
 # ─────────────────────────────────────────────────────────
+# ★★★ ADDED: Smart Print (print → 로그 + SSE 동시 전송)  ─────────────────────────
+# 위치: JSON 유틸들 정의 이후(= _loose_parse_json 뒤)라서 유틸들을 그대로 재사용 가능
+import builtins as _builtins
+
+_ORIG_PRINT = _builtins.print
+
+def _smart_print(*args, **kwargs):
+    # 1) 원래 print 동작은 그대로 수행 (콘솔 + TeeTerminal → 'terminal' 이벤트 유지)
+    _ORIG_PRINT(*args, **kwargs)
+
+    # 2) 단일 인자(dict 또는 repr 문자열)일 때만 구조화 판별 → 로그+SSE
+    try:
+        if len(args) != 1:
+            return
+        obj = args[0]
+
+        data = obj if isinstance(obj, dict) else _loose_parse_json(obj)
+        if not isinstance(data, dict) or not data:
+            return
+
+        # 태그 판별
+        tag = None
+        # (1) mcp 대화로그
+        if ("case_id" in data) and ("turns" in data) and ("stats" in data):
+            tag = "conversation_log"
+        # (2) judgement
+        elif ("persisted" in data) and ("phishing" in data) and ("risk" in data):
+            tag = "judgement"
+        # (3) guidance
+        elif ("type" in data) and ("text" in data) and (("categories" in data) or ("targets" in data)):
+            tag = "guidance"
+        # (4) prevention
+        elif ("personalized_prevention" in data):
+            tag = "prevention"
+
+        if tag:
+            safe = _truncate(data, 2000)
+            logger.info("[%s] %s", tag, json.dumps(safe, ensure_ascii=False))
+            _emit_to_stream(tag, safe)
+    except Exception:
+        # 로깅 중 예외는 전체 흐름 막지 않음
+        pass
+
+def _patch_print():
+    if getattr(_builtins, "_smart_print_patched", False):
+        return
+    _builtins.print = _smart_print
+    setattr(_builtins, "_smart_print_patched", True)
+
+def _unpatch_print():
+    if getattr(_builtins, "_smart_print_patched", False):
+        _builtins.print = _ORIG_PRINT
+        try:
+            delattr(_builtins, "_smart_print_patched")
+        except Exception:
+            pass
+# ─────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────
 # ReAct 시스템 프롬프트
 # ─────────────────────────────────────────────────────────
 REACT_SYS = (
@@ -661,6 +720,9 @@ def run_orchestrated(db: Session, payload: Dict[str, Any]) -> Dict[str, Any]:
 
     # 콘솔 스트림 보장(중복 안전)
     _ensure_console_stream_handler()
+
+    # ★★★ ADDED: Smart Print 활성화 (print → 로그+SSE 동시 송출)
+    _patch_print()
 
     # ✅ 터미널 Tee: 콘솔에도 찍고, SSE로도 보냄
     tee_out = TeeTerminal(stream_id, "stdout")
@@ -1081,6 +1143,11 @@ def run_orchestrated(db: Session, payload: Dict[str, Any]) -> Dict[str, Any]:
         with contextlib.suppress(Exception):
             tee_out.flush()
             tee_err.flush()
+
+        # ★★★ ADDED: Smart Print 원복
+        with contextlib.suppress(Exception):
+            _unpatch_print()
+
         # (SSE) run 종료 이벤트 + 정리
         with contextlib.suppress(Exception):
             _emit_to_stream("run_end", {"case_id": locals().get("case_id", ""), "rounds": locals().get("rounds_done", 0)})
