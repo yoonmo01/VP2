@@ -49,6 +49,23 @@ _StreamState = Tuple[asyncio.AbstractEventLoop, asyncio.Queue, Set[asyncio.Queue
 _STREAMS: dict[str, _StreamState] = {}
 _current_stream_id: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("_current_stream_id", default=None)
 
+_ACTIVE_STREAMS: Set[str] = set()
+_ACTIVE_RUN_KEYS: Set[str] = set()
+
+def _make_run_key(payload: Dict[str, Any]) -> str:
+    """동일 입력(오퍼더/피해자/시나리오 프로필) 실행을 하나로 간주하는 키"""
+    key = {
+        "offender_id": payload.get("offender_id"),
+        "victim_id": payload.get("victim_id"),
+        # 시나리오/프로필은 식별자나 해시가 있으면 우선 사용
+        "scenario": payload.get("scenario_id") or payload.get("scenario_hash") or payload.get("scenario"),
+        "victim_profile": payload.get("victim_profile_id") or payload.get("victim_profile"),
+    }
+    try:
+        return json.dumps(key, sort_keys=True, ensure_ascii=False)
+    except Exception:
+        return str(key)
+
 def _ensure_stream(stream_id: str) -> _StreamState:
     state = _STREAMS.get(stream_id)
     if state is None:
@@ -533,8 +550,8 @@ class ThoughtCapture(BaseCallbackHandler):
         _emit_to_stream("agent_finish", {"log": getattr(finish, "log", "")})
 
 # ─────────────────────────────────────────────────────────
-# ★★★ ADDED: Smart Print (print → 로그 + SSE 동시 전송)  ─────────────────────────
-# 위치: JSON 유틸들 정의 이후(= _loose_parse_json 뒤)라서 유틸들을 그대로 재사용 가능
+# ★★★ ADDED: Smart Print (print → 로그 + SSE 동시 전송)
+# ─────────────────────────────────────────────────────────
 import builtins as _builtins
 
 _ORIG_PRINT = _builtins.print
@@ -589,7 +606,6 @@ def _unpatch_print():
             delattr(_builtins, "_smart_print_patched")
         except Exception:
             pass
-# ─────────────────────────────────────────────────────────
 
 # ─────────────────────────────────────────────────────────
 # ReAct 시스템 프롬프트
@@ -644,7 +660,7 @@ REACT_SYS = (
     "▼ 종료/마무리 규칙\n"
     "  • max_rounds==1 이면 지침을 생성하지 말고 Final Answer로 종료한다.\n"
     "  • 모든 라운드가 끝나면 **오직 한 번만** admin.make_prevention 을 호출하여 최종 예방책을 생성한다.\n"
-    "    입력에는 누적된 대화 {{\"turns\": [...]}}, 각 라운드 판정 목록 {{\"judgements\": [...]}}, 실제 적용된 지침 목록 {{\"guidances\": [...]}} 를 넣고,\n"
+    "    입력에는 누적된 대화 {{\"turns\": [...]}}, 각 라운드 판정 목록 {{\"judgements\": [...]}} , 실제 적용된 지침 목록 {{\"guidances\": [...]}} 를 넣고,\n"
     "    지정 스키마(personalized_prevention)의 JSON만 반환하도록 한다. 라운드 중간에는 호출 금지.\n"
     "\n"
     "▼ 오류/예외 복구 규칙\n"
@@ -713,6 +729,13 @@ def build_agent_and_tools(db: Session, use_tavily: bool) -> Tuple[AgentExecutor,
 def run_orchestrated(db: Session, payload: Dict[str, Any]) -> Dict[str, Any]:
     # (SSE) 스트림 컨텍스트 시작: 프론트가 전달한 stream_id 사용(없으면 내부 생성)
     stream_id = str(payload.get("stream_id") or uuid.uuid4())
+
+    run_key = _make_run_key(payload)
+    if stream_id in _ACTIVE_STREAMS or run_key in _ACTIVE_RUN_KEYS:
+        raise HTTPException(status_code=409, detail="duplicated simulation run detected")
+    _ACTIVE_STREAMS.add(stream_id)
+    _ACTIVE_RUN_KEYS.add(run_key)
+
     token = _current_stream_id.set(stream_id)
 
     # (고급 SSE) 전역/외부 로거 핸들러 부착
@@ -750,6 +773,8 @@ def run_orchestrated(db: Session, payload: Dict[str, Any]) -> Dict[str, Any]:
             guidance_history: List[Dict[str, Any]] = []
             judgements_history: List[Dict[str, Any]] = []
             turns_all: List[Dict[str, str]] = []
+            prevention_created: bool = False   # 중복 예방책 생성/저장 방지
+            prevention_obj: Dict[str, Any] = {}  # 반환용
 
             # 1) 프롬프트 패키지 (DB 조립)
             pkg = build_prompt_package_from_payload(
@@ -765,8 +790,11 @@ def run_orchestrated(db: Session, payload: Dict[str, Any]) -> Dict[str, Any]:
 
             offender_id = int(req.offender_id or 0)
             victim_id = int(req.victim_id or 0)
-            # max_rounds = max(2, min(req.round_limit or 4, 5))  # 2~5
-            max_rounds = 1
+
+            # 라운드 정책: 최소 2, 최대 5 (단, finished_chain/critical/prevention 신호면 즉시 종료)
+            min_rounds = 2
+            req_max = req.round_limit if hasattr(req, "round_limit") and req.round_limit else 5
+            max_rounds = max(2, min(int(req_max), 5))
 
             guidance_kind: Optional[str] = None
             guidance_text: Optional[str] = None
@@ -889,7 +917,19 @@ def run_orchestrated(db: Session, payload: Dict[str, Any]) -> Dict[str, Any]:
                 sim_obs = _last_observation(cap, "mcp.simulator_run")
                 sim_dict = _loose_parse_json(sim_obs)
 
-                # (1) 휴리스틱 기반 1차 폴백: agent가 data로 감쌌거나 top-level missing이면 언랩 직접 호출
+                obs_text_low = str(sim_obs).lower()
+                finished_chain = ("finished chain" in obs_text_low) \
+                                or ("finished_chain" in obs_text_low) \
+                                or (str(sim_dict.get("ended_by","")).lower() == "finished_chain")
+
+                sim_prevention_flag = bool(
+                    sim_dict.get("personalized_prevention")
+                    or sim_dict.get("prevention_created")
+                )
+
+                hard_stop_from_sim = finished_chain or sim_prevention_flag
+
+                # (1) 휴리스틱 기반 1차 폴백
                 bad_top = _looks_like_missing_top_fields_error(sim_dict)
                 sent_wrapped = (cap.last_tool_input == {"data": sim_payload})
                 if (not sim_dict.get("ok") and bad_top) or sent_wrapped:
@@ -900,7 +940,7 @@ def run_orchestrated(db: Session, payload: Dict[str, Any]) -> Dict[str, Any]:
                     tool_res = tool.invoke(sim_payload)  # 언랩 직접 호출
                     sim_dict = _loose_parse_json(tool_res)
 
-                # (2) 여전히 실패면, '반대 형태'로 무조건 1회 더 시도(래핑 ↔ 언랩 스위치)
+                # (2) 반대 형태 재시도
                 if not sim_dict.get("ok"):
                     _emit_to_stream("debug", {"where": "mcp.simulator_run", "hint": "first_shape_failed_try_opposite"})
                     tool = _get_tool(ex, "mcp.simulator_run")
@@ -908,15 +948,12 @@ def run_orchestrated(db: Session, payload: Dict[str, Any]) -> Dict[str, Any]:
                         raise HTTPException(500, detail="mcp.simulator_run tool not found")
 
                     try:
-                        # EXPECT_MCP_DATA_WRAPPER 기준의 '반대' 형태로 재시도
                         if EXPECT_MCP_DATA_WRAPPER:
                             tool_res2 = tool.invoke(_clean_payload(sim_payload, allow_extras=False, allowed_keys=list(sim_payload.keys())))
                         else:
                             tool_res2 = tool.invoke({"data": sim_payload})
 
                         sim_dict2 = _loose_parse_json(tool_res2)
-
-                        # 어떤 결과든 SSE로도 노출
                         _emit_to_stream("tool_observation", {"tool": "mcp.simulator_run(retry-opposite)", "output": _truncate(sim_dict2, 1000)})
 
                         if sim_dict2.get("ok"):
@@ -1045,7 +1082,73 @@ def run_orchestrated(db: Session, payload: Dict[str, Any]) -> Dict[str, Any]:
                     "evidence": judgement.get("evidence") or reason
                 })
 
-                # ── (C) 다음 라운드를 위한 지침 선택 ──
+                # ── (C) 종료 조건: finished_chain / prevention / critical / 최대라운드 ──
+                stop_on_critical  = (risk_lvl == "critical")
+                hit_max_rounds    = (round_no >= max_rounds)
+
+                # finished_chain 또는 simulator가 prevention 생성한 경우 → 즉시 종료
+                will_stop_now = (hard_stop_from_sim or stop_on_critical or hit_max_rounds)
+
+                if will_stop_now:
+                    reason_stop = (
+                        "finished_chain_or_prev" if hard_stop_from_sim else
+                        ("critical" if stop_on_critical else "max_rounds")
+                    )
+                    logger.info("[StopCondition] 종료 | reason=%s | round=%s", reason_stop, round_no)
+
+                    # 만약 sim이 이미 prevention을 제공했다면 그대로 채택 (재생성·재저장 금지)
+                    if sim_prevention_flag:
+                        if not prevention_created:
+                            prevention_obj = sim_dict.get("personalized_prevention") or {}
+                            prevention_created = True
+                    else:
+                        # sim에서 제공하지 않았고, 아직 만든 적 없으면 지금 생성/저장
+                        if not prevention_created:
+                            prevention_payload = {
+                                "data": {
+                                    "case_id": case_id,
+                                    "rounds": round_no,       # 지금까지 진행한 라운드 수
+                                    "turns": turns_all,       # 누적 턴
+                                    "judgements": judgements_history,
+                                    "guidances": guidance_history,
+                                    "format": "personalized_prevention",
+                                }
+                            }
+                            res_prev = ex.invoke(
+                                {"input": "admin.make_prevention 호출.\n" + json.dumps(prevention_payload, ensure_ascii=False)},
+                                callbacks=[cap],
+                            )
+                            used_tools.append("admin.make_prevention")
+
+                            prev_obs = _last_observation(cap, "admin.make_prevention")
+                            prev_dict = _loose_parse_json(prev_obs) or _loose_parse_json(res_prev)
+                            prevention_obj = prev_dict.get("personalized_prevention") or {}
+
+                            if prevention_obj:
+                                summary = prevention_obj.get("summary", "")
+                                steps = prevention_obj.get("steps", [])
+                                save_payload = {
+                                    "data": {
+                                        "case_id": case_id,
+                                        "offender_id": offender_id,
+                                        "victim_id": victim_id,
+                                        "run_no": round_no,
+                                        "summary": summary,
+                                        "steps": steps
+                                    }
+                                }
+                                ex.invoke(
+                                    {"input": "admin.save_prevention 호출.\n" + json.dumps(save_payload, ensure_ascii=False)},
+                                    callbacks=[cap],
+                                )
+                                used_tools.append("admin.save_prevention")
+
+                            prevention_created = True
+
+                    # 즉시 종료 (지침 생성·다음 라운드 스케줄 없음)
+                    break
+
+                # ── (D) 다음 라운드를 위한 지침 선택 ──
                 if round_no < max_rounds:
                     guidance_kind = "P" if phishing else "A"
                     logger.info("[GuidanceKind] round=%s | phishing=%s | kind=%s", round_no, phishing, guidance_kind)
@@ -1068,64 +1171,50 @@ def run_orchestrated(db: Session, payload: Dict[str, Any]) -> Dict[str, Any]:
                     guidance_text = _extract_guidance_text(pick_obs) or _extract_guidance_text(res_pick) or "기본 예방 수칙을 따르세요."
                     logger.info("[GuidancePicked] round=%s | kind=%s | text=%s", round_no, guidance_kind, _truncate(guidance_text, 300))
 
-                # ── (E) 종료 조건 ───────────────────────────────────
-                MIN_ROUNDS = 1
-                MAX_ROUNDS = 1
-
-                stop_on_critical = (risk_lvl == "critical") and (round_no >= MIN_ROUNDS)
-                hit_max_rounds   = (round_no >= MAX_ROUNDS)
-
-                if stop_on_critical or hit_max_rounds:
-                    logger.info(
-                        "[StopCondition] 종료 | reason=%s | round=%s",
-                        ("critical" if stop_on_critical else "max_rounds"),
-                        round_no,
-                    )
-                    break
-
             # ---- (F) 최종예방책: 모든 라운드 종료 후 단 한 번 호출 ----
-            prevention_payload = {
-                "data": {
-                    "case_id": case_id,
-                    "rounds": rounds_done,
-                    "turns": turns_all,
-                    "judgements": judgements_history,
-                    "guidances": guidance_history,
-                    "format": "personalized_prevention"
-                }
-            }
-            res_prev = ex.invoke(
-                {"input": "admin.make_prevention 호출.\n" + json.dumps(prevention_payload, ensure_ascii=False)},
-                callbacks=[cap],
-            )
-            used_tools.append("admin.make_prevention")
-
-            prev_obs = _last_observation(cap, "admin.make_prevention")
-            prev_dict = _loose_parse_json(prev_obs) or _loose_parse_json(res_prev)
-            if not prev_dict.get("ok"):
-                logger.error("[PreventionFail] obs=%s | res=%s", _truncate(prev_obs), _truncate(res_prev))
-                prevention_obj = {}
-            else:
-                prevention_obj = prev_dict.get("personalized_prevention") or {}
-
-            if prevention_obj:
-                summary = prevention_obj.get("summary", "")
-                steps = prevention_obj.get("steps", [])
-                save_payload = {
+            if not prevention_created:
+                prevention_payload = {
                     "data": {
                         "case_id": case_id,
-                        "offender_id": offender_id,
-                        "victim_id": victim_id,
-                        "run_no": rounds_done,
-                        "summary": summary,
-                        "steps": steps
+                        "rounds": rounds_done,
+                        "turns": turns_all,
+                        "judgements": judgements_history,
+                        "guidances": guidance_history,
+                        "format": "personalized_prevention"
                     }
                 }
-                res_save = ex.invoke(
-                    {"input": "admin.save_prevention 호출.\n" + json.dumps(save_payload, ensure_ascii=False)},
+                res_prev = ex.invoke(
+                    {"input": "admin.make_prevention 호출.\n" + json.dumps(prevention_payload, ensure_ascii=False)},
                     callbacks=[cap],
                 )
-                used_tools.append("admin.save_prevention")
+                used_tools.append("admin.make_prevention")
+
+                prev_obs = _last_observation(cap, "admin.make_prevention")
+                prev_dict = _loose_parse_json(prev_obs) or _loose_parse_json(res_prev)
+                if not prev_dict.get("ok"):
+                    logger.error("[PreventionFail] obs=%s | res=%s", _truncate(prev_obs), _truncate(res_prev))
+                    prevention_obj = {}
+                else:
+                    prevention_obj = prev_dict.get("personalized_prevention") or {}
+
+                if prevention_obj:
+                    summary = prevention_obj.get("summary", "")
+                    steps = prevention_obj.get("steps", [])
+                    save_payload = {
+                        "data": {
+                            "case_id": case_id,
+                            "offender_id": offender_id,
+                            "victim_id": victim_id,
+                            "run_no": rounds_done,
+                            "summary": summary,
+                            "steps": steps
+                        }
+                    }
+                    ex.invoke(
+                        {"input": "admin.save_prevention 호출.\n" + json.dumps(save_payload, ensure_ascii=False)},
+                        callbacks=[cap],
+                    )
+                    used_tools.append("admin.save_prevention")
 
             return {
                 "status": "success",
@@ -1140,6 +1229,10 @@ def run_orchestrated(db: Session, payload: Dict[str, Any]) -> Dict[str, Any]:
             }
 
     finally:
+
+        with contextlib.suppress(Exception):
+            _ACTIVE_STREAMS.discard(stream_id)
+            _ACTIVE_RUN_KEYS.discard(run_key)
         # 남은 버퍼 강제 flush
         with contextlib.suppress(Exception):
             tee_out.flush()
@@ -1200,7 +1293,7 @@ async def run_orchestrated_stream(db: Session, payload: Dict[str, Any]):
             yield ev
 
             # run_end 또는 error 이후, 백그라운드 작업이 종료되면 루프 종료
-            if ev.get("type") in ("run_end", "error"):
+            if ev.get("type") in ("run_end", "error", "result"):
                 if task.done():
                     break
 

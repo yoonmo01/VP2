@@ -22,7 +22,7 @@ async def simulate_stream(
     offender_id: int,
     victim_id: int,
     max_turns: int = 15,
-    round_limit: int = 2,
+    round_limit: int = 5,
     case_id: Optional[str] = None,
     use_tavily: bool = False,
     db: Session = Depends(get_db),
