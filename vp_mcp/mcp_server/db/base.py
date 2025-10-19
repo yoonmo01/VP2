@@ -7,7 +7,7 @@ class Base(DeclarativeBase):
     pass
 
 # 환경변수에서 DB URL 읽기 (PostgreSQL)
-DB_URL = os.getenv("MCP_DATABASE_URL", "postgresql+psycopg://mcp:0320@localhost:5432/mcpdb")
+DB_URL = os.getenv("MCP_DATABASE_URL", "postgresql+psycopg://mcp:1007@localhost:5432/mcpdb")
 
 # PostgreSQL용 Engine
 engine = create_engine(

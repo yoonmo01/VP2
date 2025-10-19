@@ -8,7 +8,7 @@ class Conversation(Base):
     __tablename__ = "conversation"
     id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
     meta_json: Mapped[str] = mapped_column(Text, default="{}")
-    ended_by: Mapped[str] = mapped_column(String(16), default="")
+    ended_by: Mapped[str] = mapped_column(String(64), default="")
 
     @classmethod
     def create(cls, db, meta: dict) -> "Conversation":

@@ -26,7 +26,7 @@ class Settings(BaseSettings):
     POSTGRES_PORT: int = 5432
     POSTGRES_DB: str = "voicephish"
     POSTGRES_USER: str = "vpuser"
-    POSTGRES_PASSWORD: str = "0320"
+    POSTGRES_PASSWORD: str = "1007"
     SYNC_ECHO: bool = False
 
     # Keys
