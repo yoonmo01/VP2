@@ -21,26 +21,6 @@ export default function CustomScenarioModal({
   const [submitting, setSubmitting] = useState(false);
   const canSubmit = purpose.trim().length > 0 && TYPE_OPTIONS.includes(type);
 
-  // --- 기본값: profile.steps & source (그대로 전송) ---
-  const defaultSteps = useMemo(
-    () => [
-      "보이스피싱 조직원(1)이 금융기관 직원 사칭하여 피해자에게 전화(저금리 대출을 제안)",
-      "저금리대출 제안하고 피해자의 대출 신청 유도함",
-      "보이스피싱 조직원(2)이 피해자가 기존에 대출 받은 금융기관 직원을 사칭하여 다시 전화 걺",
-      "기존 대출금 상환 요구",
-      "피해자로부터 현금 혹은 계좌 송금을 통하여 돈을 교부받음",
-    ],
-    []
-  );
-
-  const defaultSource = useMemo(
-    () => ({
-      title: "보이스피싱 범행단계별 대응방안 연구",
-      page: "65쪽",
-      url: "https://www.kicj.re.kr/board.es?mid=a10101000000&bid=0001&tag=&act=view&list_no=13914",
-    }),
-    []
-  );
 
   // --- API POST ---
   async function createScenario() {
@@ -52,16 +32,15 @@ export default function CustomScenarioModal({
       type,                     // 버튼에서 고른 값 그대로 텍스트 전송
       profile: {
         purpose: purpose.trim(),
-        steps: defaultSteps,
+        steps: [],           // ← 백엔드가 LLM으로 4~7개 생성
       },
-      source: defaultSource,
     };
 
     try {
       const ctrl = new AbortController();
       const timer = setTimeout(() => ctrl.abort(), 15000);
 
-      const res = await fetch("/api/make/offenders/", {
+      const res = await fetch("/api/make/offenders/auto", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
