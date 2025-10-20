@@ -74,23 +74,17 @@ const SimulatorPage = ({
   boardDelaySec = 3,
   intermissionSec = 3,
   logTickMs = 200,
+  victimImageUrl,
 }) => {
   //SSE 이벤트 실행 트리거
-  const { 
-    logs,
-    messages,
-    start,
-    stop,
-    running,
-    judgement,
-    guidance,
-    prevention, } = useSimStream(setMessages);
+  const { logs, messages, start, running, judgement, guidance, prevention } = useSimStream(setMessages);
      
   /* ----------------------------------------------------------
    🧩 상태
   ---------------------------------------------------------- */
   const needScenario = !selectedScenario;
   const needCharacter = !selectedCharacter;
+
   const [selectedTag, setSelectedTag] = useState(null);
   const [showCustomModal, setShowCustomModal] = useState(false);
   const [customScenarios, setCustomScenarios] = useState([]);
@@ -105,13 +99,17 @@ const SimulatorPage = ({
 
   // ✅ SSE 스트림 실행
   const handleStartStream = useCallback(() => {
+    try {
     if (!selectedScenario || !selectedCharacter) return;
     start({
       offender_id: 1,
       victim_id: selectedCharacter?.id ?? 1,
       scenario_id: selectedScenario?.id ?? 1,
     });
-  }, [start, selectedCharacter, selectedScenario]);
+  } catch (err) {
+    console.error("SimulatorPage 실행 중 오류:", err);
+  }
+}, [start, selectedCharacter, selectedScenario]);
 
   /* ✅ 새 메시지 들어올 때 자동 스크롤 유지 */
   // useEffect(() => {
@@ -142,6 +140,8 @@ const SimulatorPage = ({
     const role = (m?.sender || m?.role || "").toLowerCase();
     return {
       ...m,
+      sender: role,             // ← MessageBubble이 이걸 씀
+      role,
       label:
         role === "offender" ? "피싱범" : role === "victim" ? "피해자" : "시스템",
       side: role === "offender" ? "left" : role === "victim" ? "right" : "center",
@@ -578,13 +578,13 @@ const SimulatorPage = ({
                       </div>
 
                       {/* 대화 렌더링 */}
-                      {!messages.length && (
+                      {!messages?.length && (
                         <SpinnerMessage
                           simulationState={simulationState}
                           COLORS={THEME}
                         />
                       )}
-                      {messages.map((m, idx) => {
+                      {messages?.map((m, idx) => {
                         const nm = normalizeMessage(m);
                         return (
                           <MessageBubble
@@ -595,6 +595,8 @@ const SimulatorPage = ({
                             label={nm.label}
                             side={nm.side}
                             role={nm.role}
+                            selectedCharacter={selectedCharacter}
+                            victimImageUrl={victimImageUrl}
                             COLORS={THEME}
                           />
                         );

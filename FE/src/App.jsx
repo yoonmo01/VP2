@@ -1,6 +1,7 @@
 // src/App.jsx
 import { useEffect, useLayoutEffect, useRef, useState, useCallback } from "react";
 import LandingPage from "./LandingPage";
+import ErrorBoundary from "./ErrorBoundary";
 import SimulatorPage from "./SimulatorPage";
 import ReportPage from "./ReportPage";
 
@@ -713,7 +714,7 @@ const addChat = (sender, content, timestamp = null, senderLabel = null, side = n
       {currentPage === "landing" && (
         <LandingPage setCurrentPage={setCurrentPage} />
       )}
-      {currentPage === "simulator" && <SimulatorPage {...pageProps} />}
+      {currentPage === "simulator" && <ErrorBoundary><SimulatorPage {...pageProps} /></ErrorBoundary>}
       {currentPage === "report" && (
         <ReportPage {...pageProps} defaultCaseData={defaultCaseData} />
       )}
