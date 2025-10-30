@@ -91,6 +91,16 @@ const SimulatorPage = ({
   const [customVictims, setCustomVictims] = useState([]);
   const [openTTS, setOpenTTS] = useState(false);
 
+  // guidance / prevention 도 동일 패턴으로 가드
+  const normalizedGuidance = useMemo(() => {
+    const ev = guidance?.event ?? guidance;
+    return ev?.content ?? ev ?? null;
+  }, [guidance]);
+  const normalizedPrevention = useMemo(() => {
+    const ev = prevention?.event ?? prevention;
+    return ev?.content ?? ev ?? null;
+  }, [prevention]);
+
   // 🎯 스크롤/탭/보드 상태
   const localScrollContainerRef = useRef(null);
   const scrollRef = injectedScrollContainerRef ?? localScrollContainerRef;
@@ -130,6 +140,51 @@ const SimulatorPage = ({
     if (!el) return;
     el.scrollTop = el.scrollHeight;
   }, [messages]);
+
+  // json 출력
+  const JsonBlock = ({ title = "", obj, theme }) => {
+    if (!obj) return null;
+    return (
+      <div
+        className="mt-4 p-3 rounded-lg border text-xs overflow-auto"
+        style={{
+          borderColor: theme.border,
+          backgroundColor: theme.panelDarker,
+          color: theme.text,
+          maxHeight: 300,
+          whiteSpace: "pre-wrap",
+          wordBreak: "break-word",
+        }}
+      >
+        {title && (
+          <div
+            className="font-semibold mb-2"
+            style={{ color: theme.sub }}
+          >
+            {title}
+          </div>
+        )}
+        <pre>{JSON.stringify(obj, null, 2)}</pre>
+      </div>
+    );
+  };
+  // judgement 구조가 {type:'judgement', event:{...}} 일 수도/아닐 수도 있으니 통합
+  const normalizedJudgement = useMemo(() => {
+    const ev = judgement?.event ?? judgement;
+    const raw = ev?.content ?? ev;
+    if (!raw || typeof raw !== "object") return null;
+    return {
+      case_id: raw.case_id,
+      run_no: raw.run_no,
+      phishing: raw.phishing,
+      risk: raw.risk,                 // { score, level, rationale }
+      continue: raw["continue"],         // { recommendation, reason }
+      evidence: raw.evidence,         // string
+      victim_vulnerabilities: raw.victim_vulnerabilities, // string[]
+      ok: raw.ok,
+      persisted: raw.persisted,
+    };
+  }, [judgement]);
 
   // 진행률 계산에 쓰는 로컬 카운터(선언을 hasChatLog보다 위에 둠)
   const countChatMessagesLocal = (msgs = []) =>
@@ -648,12 +703,58 @@ const SimulatorPage = ({
                         {activeAgentTab === "log" ? (
                           <TerminalLog logs={logs} COLORS={THEME} />
                         ) : showBoardContent ? (
-                          <InvestigationBoard
-                            COLORS={THEME}
-                            judgement={judgement}
-                            guidance={guidance}
-                            prevention={prevention}
-                          />
+                          <div className="flex flex-col gap-4">
+                            {/* 기존 보드 */}
+                            <InvestigationBoard
+                              COLORS={THEME}
+                              judgement={judgement}
+                              guidance={guidance}
+                              prevention={prevention}
+                            />
+
+                            {/* 요약 카드 (빠른 확인용) */}
+                            {normalizedJudgement && (
+                              <div
+                                className="mt-2 p-4 rounded-xl border"
+                                style={{ borderColor: THEME.border, backgroundColor: THEME.panelDark }}
+                              >
+                                <div className="font-semibold mb-3" style={{ color: THEME.text }}>
+                                  ⚖️ 판정 요약 (Judgement)
+                                </div>
+                                <div className="text-sm space-y-2" style={{ color: THEME.sub }}>
+                                  <div><b style={{ color: THEME.text }}>case_id</b>: {normalizedJudgement.case_id}</div>
+                                  <div><b style={{ color: THEME.text }}>run_no</b>: {normalizedJudgement.run_no}</div>
+                                  <div>
+                                    <b style={{ color: THEME.text }}>phishing</b>: {String(normalizedJudgement.phishing)}
+                                  </div>
+                                  <div>
+                                    <b style={{ color: THEME.text }}>risk</b>: {normalizedJudgement?.risk?.level} (score: {normalizedJudgement?.risk?.score})
+                                  </div>
+                                  <div>
+                                    <b style={{ color: THEME.text }}>reason</b>: {normalizedJudgement?.continue?.reason}
+                                  </div>
+                                  <div>
+                                    <b style={{ color: THEME.text }}>evidence</b>: {normalizedJudgement?.evidence}
+                                  </div>
+                                  {Array.isArray(normalizedJudgement?.victim_vulnerabilities) && (
+                                    <div>
+                                      <b style={{ color: THEME.text }}>vulnerabilities</b>:
+                                      <ul className="list-disc pl-5">
+                                        {normalizedJudgement.victim_vulnerabilities.map((v, i) => (
+                                          <li key={i}>{v}</li>
+                                        ))}
+                                      </ul>
+                                    </div>
+                                  )}
+                                </div>
+                              </div>
+                            )}
+
+                            {/* Raw JSON (그대로 보고 싶을 때) */}
+                            <JsonBlock title="[SSE Event] judgement (raw)" obj={judgement} theme={THEME} />
+                            <JsonBlock title="[SSE Event] guidance  (raw)" obj={guidance}  theme={THEME} />
+                            <JsonBlock title="[SSE Event] prevention(raw)" obj={prevention} theme={THEME} />
+                          </div>
                         ) : (
                           <div
                             className="p-4 text-sm opacity-70"

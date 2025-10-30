@@ -169,6 +169,11 @@ export async function* streamReactSimulation(payload = {}) {
     "error",
     "terminal",
     "conversation_log",  // ✅ 이미 있음
+    "judgement",
+    "guidance",
+    "prevention",
+    "guidance_generated",
+    "prevention_generated",
   ];
   
   // ✅ 디버깅 4: 등록 확인
