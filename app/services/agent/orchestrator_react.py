@@ -179,7 +179,15 @@ def _emit_to_stream(kind: str, content: Any):
         loop.call_soon_threadsafe(q.put_nowait, ev)
     except Exception:
         pass
-
+# ✅ run_end 전용 헬퍼(이유 메타 포함)
+def _emit_run_end(reason: str, meta: Optional[Dict[str, Any]] = None):
+    try:
+        payload = {"reason": reason}
+        if meta:
+            payload.update(meta)
+        _emit_to_stream("run_end", payload)
+    except Exception:
+        pass
 class _LogToSSEHandler(logging.Handler):
     """이 모듈 logger로 찍히는 로그를 SSE로 복제 (방탄 처리)"""
     def emit(self, record: logging.LogRecord):
@@ -1337,6 +1345,12 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
                         used_tools.append("admin.save_prevention")
                         prevention_created = True
                         logger.info("[Prevention] prevention_created set True for case_id=%s", case_id)
+                        # ✅ 여기서 '최종예방책 생성 완료' 전용 신호 송신
+                        _emit_to_stream("chain_finished", {
+                            "case_id": case_id,
+                            "rounds": rounds_done,
+                            "finished_reason": finished_reason,  # "critical" | "rounds_exhausted"
+                        })
 
             # (정상 종료 전 정리) MCP 서버 중지 보장 + run_end 즉시 알림
             try:
@@ -1358,7 +1372,7 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
                 "personalized_prevention": prevention_obj,  # ★ 최종예방책 포함
             }
             with contextlib.suppress(Exception):
-                _emit_to_stream("run_end", {"case_id": case_id, "rounds": rounds_done, "status": "success"})
+                _emit_run_end("success", {"case_id": case_id, "rounds": rounds_done})
                 _emitted_run_end = True
             return result_obj
 
@@ -1377,9 +1391,9 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
             _unpatch_print()
 
         # (SSE) run 종료 이벤트 + 정리 (이미 보냈다면 생략)
-        with contextlib.suppress(Exception):
-            if not _emitted_run_end:
-                _emit_to_stream("run_end", {"case_id": locals().get("case_id", ""), "rounds": locals().get("rounds_done", 0)})
+        # with contextlib.suppress(Exception):
+        #     if not _emitted_run_end:
+        #         _emit_to_stream("run_end", {"case_id": locals().get("case_id", ""), "rounds": locals().get("rounds_done", 0)})
         with contextlib.suppress(Exception):
             _current_stream_id.reset(token)
         with contextlib.suppress(Exception):
