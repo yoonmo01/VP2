@@ -1,9 +1,12 @@
-# app/services/simulation.py
+# app/services/simulation.py  ← 교체/추가
+
 from __future__ import annotations
 
 from typing import Dict, Any, List, Tuple, Optional
 from uuid import UUID
 import re
+import os
+from datetime import datetime
 import json as _json
 
 from sqlalchemy.orm import Session
@@ -17,34 +20,40 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from app.services.llm_providers import attacker_chat, victim_chat
 from app.services.admin_summary import summarize_case
 
-# prompt.py의 동적 system 문자열 빌더 사용(템플릿 구조는 prompt.py 기준)
 from app.services.prompts import (
     render_attacker_system_string,
     render_victim_system_string,
-    build_guidance_block_from_meta,  # (내부에서 사용되므로 import 유지)
+    build_guidance_block_from_meta,
 )
 from app.schemas.conversation import ConversationRunRequest
 
-# ─────────────────────────────────────────────────────────
-# 발화 하드캡(안전장치). 실제 "턴(티키타카)" 제한은 max_turns로 제어한다.
-# 한 턴 = 공격자 1발화 + 피해자 1발화.
-# ─────────────────────────────────────────────────────────
 MAX_OFFENDER_TURNS = settings.MAX_OFFENDER_TURNS
-MAX_VICTIM_TURNS = settings.MAX_VICTIM_TURNS
+MAX_VICTIM_TURNS   = settings.MAX_VICTIM_TURNS
 
-# 종료 트리거(느슨한 매칭): 공격자가 말하면 종료
-END_TRIGGERS = [r"마무리하겠습니다"]
+END_TRIGGERS    = [r"마무리하겠습니다"]
 VICTIM_END_LINE = "시뮬레이션을 종료합니다."
 
 
 def _assert_turn_role(turn_index: int, role: str):
-    """
-    DB에 저장되는 turn_index는 '반쪽 턴(발화 1회)' 인덱스.
-    짝수 = offender, 홀수 = victim 이 되도록 강제.
-    """
     expected = "offender" if turn_index % 2 == 0 else "victim"
     if role != expected:
         raise ValueError(f"Turn {turn_index} must be {expected}, got {role}")
+
+
+def _extract_intent_and_strip(text: str) -> tuple[str, Optional[str]]:
+    """
+    공격자 출력의 마지막 줄 형태:
+      INTENT: <라벨>
+    을 찾아 라벨을 반환하고, 본문에서는 그 줄을 제거한다.
+    """
+    s = text.strip()
+    m = re.search(r"(?mi)^\s*INTENT:\s*([^\r\n]+)\s*$", s)
+    if not m:
+        return s, None
+    label = m.group(1).strip()
+    # INTENT: 라인 제거
+    cleaned = re.sub(r"(?mi)^\s*INTENT:\s*[^\r\n]+\s*$", "", s).rstrip()
+    return cleaned, label
 
 
 def _save_turn(
@@ -57,13 +66,11 @@ def _save_turn(
     content: str,
     label: str | None = None,
     *,
-    # 메타 표식(옵션)
     use_agent: bool = False,
     run: int = 1,
     guidance_type: str | None = None,
     guideline: str | None = None,
 ):
-    """ConversationLog에 한 발화를 저장(반쪽 턴 단위)."""
     _assert_turn_role(turn_index, role)
     log = m.ConversationLog(
         case_id=case_id,
@@ -83,20 +90,11 @@ def _save_turn(
 
 
 def _hit_end(text: str) -> bool:
-    """공격자의 종료 문구 감지(느슨 매칭)."""
     norm = text.strip()
     return any(re.search(pat, norm) for pat in END_TRIGGERS)
 
 
 def run_two_bot_simulation(db: Session, req: ConversationRunRequest) -> Tuple[UUID, int]:
-    """
-    시뮬레이터 메인.
-    - 기본: 새 AdminCase 생성 (case_id_override가 있으면 이어쓰기)
-    - turn_index는 '반쪽 턴(발화 1회)' 기준으로 +1
-    - 반환 total_turns는 '진짜 턴(티키타카)' 개수 (공1+피1=1)
-    - max_turns(기본 15): 턴(티키타카) 개수 제한
-    - MAX_OFFENDER_TURNS/MAX_VICTIM_TURNS는 한쪽 발화 하드캡(안전장치)
-    """
     # ── 케이스 준비 ─────────────────────────────────────
     case_id_override: Optional[UUID] = getattr(req, "case_id_override", None)
     incoming_scenario: Dict[str, Any] = (
@@ -110,7 +108,7 @@ def run_two_bot_simulation(db: Session, req: ConversationRunRequest) -> Tuple[UU
         if not case:
             raise ValueError(f"AdminCase {case_id_override} not found")
         scenario = (case.scenario or {}).copy()
-        scenario.update(incoming_scenario)  # ← scenario 병합
+        scenario.update(incoming_scenario)
         case.scenario = scenario
         db.add(case)
         db.commit()
@@ -122,16 +120,14 @@ def run_two_bot_simulation(db: Session, req: ConversationRunRequest) -> Tuple[UU
         db.refresh(case)
 
     offender = db.get(m.PhishingOffender, req.offender_id)
-    victim = db.get(m.Victim, req.victim_id)
+    victim   = db.get(m.Victim,          req.victim_id)
     if offender is None:
         raise ValueError(f"Offender {req.offender_id} not found")
     if victim is None:
         raise ValueError(f"Victim {req.victim_id} not found")
 
-    # ── 메타 표식 ──────────────────────────────────────
     use_agent: bool = bool(getattr(req, "use_agent", False))
 
-    # run_no 계산(강화): run_no → round_no 순서로 읽고, 이어달리기+미지정이면 max(run)+1
     run_no_attr = getattr(req, "run_no", None)
     if run_no_attr is None:
         run_no_attr = getattr(req, "round_no", None)
@@ -149,7 +145,6 @@ def run_two_bot_simulation(db: Session, req: ConversationRunRequest) -> Tuple[UU
     else:
         run_no = int(run_no_attr or 1)
 
-    # ⬇️ guidance 주입 (우선순위: req.guidance > req.guideline > case_scenario.guideline)
     cs: Dict[str, Any] = getattr(req, "case_scenario", None) or getattr(req, "scenario", None) or {}
     guidance_dict: Dict[str, Any] | None = getattr(req, "guidance", None)
     guidance_text: Optional[str] = None
@@ -162,24 +157,20 @@ def run_two_bot_simulation(db: Session, req: ConversationRunRequest) -> Tuple[UU
     if not guidance_type:
         guidance_type = getattr(req, "guidance_type", None) or cs.get("guidance_type")
 
-    # ── LLM 준비 ──────────────────────────────────────
     attacker_llm = attacker_chat()
-    victim_llm = victim_chat()
+    victim_llm   = victim_chat()
 
-    # ⬇️ 피해자 프로필 오버라이드(요청이 있으면 DB보다 우선)
     victim_profile: Dict[str, Any] = getattr(req, "victim_profile", {}) or {}
-    meta_override = victim_profile.get("meta")
-    knowledge_override = victim_profile.get("knowledge")
-    traits_override = victim_profile.get("traits")
+    meta_override       = victim_profile.get("meta")
+    knowledge_override  = victim_profile.get("knowledge")
+    traits_override     = victim_profile.get("traits")
 
     history_attacker: list = []
-    history_victim: list = []
-    turn_index = 0                    # 반쪽 턴 인덱스(발화마다 +1)
-    attacks = replies = 0             # 반쪽 턴 카운트(각 역할 발화 수)
-    turns_executed = 0                # 진짜 턴(티키타카) 카운트
+    history_victim:  list  = []
+    turn_index = 0
+    attacks = replies = 0
+    turns_executed = 0
 
-    # ── Step-Lock: 단계와 커서 ─────────────────────────
-    # 요청이 준 case_scenario(또는 scenario)를 **최우선** 사용 (DB profile fallback 제거)
     scenario_all = (
         (getattr(req, "case_scenario", None) or getattr(req, "scenario", None) or {})
         if not case_id_override else
@@ -188,98 +179,106 @@ def run_two_bot_simulation(db: Session, req: ConversationRunRequest) -> Tuple[UU
     steps: List[str] = (scenario_all.get("steps") or [])
     if not steps:
         raise ValueError("시나리오 steps가 비어 있습니다. request.case_scenario.steps 를 지정하세요.")
-
     current_step_idx = 0
 
-    # 첫 턴 전 상태
-    last_victim_text = ""
+    last_victim_text   = ""
     last_offender_text = ""
 
-    # ── max_turns(티키타카 횟수) 보정 ──────────────────
     max_turns = getattr(req, "max_turns", None) or 15
-
-    # guidance 메타 → (render_*_system_string 내부에서 block 생성)
     guidance_meta = {"text": guidance_text or "", "type": guidance_type or ""} if (guidance_text or guidance_type) else None
 
-    # 피해자 설득도/경험 추적
     is_convinced_prev: Optional[int] = None
     previous_experience: str = ""
 
+    # JSON 저장용 버퍼
+    json_log: Dict[str, Any] = {
+        "case_id": str(case.id),
+        "run_no": run_no,
+        "offender_id": offender.id,
+        "victim_id": victim.id,
+        "scenario": scenario_all,
+        "guidance": {"text": guidance_text, "type": guidance_type},
+        "turns": [],  # 각 턴: {turn_index, role, content, label}
+        "meta": {
+            "created_at": datetime.utcnow().isoformat() + "Z",
+            "max_turns": max_turns,
+            "limits": {"offender": MAX_OFFENDER_TURNS, "victim": MAX_VICTIM_TURNS},
+        },
+    }
+
     for _ in range(max_turns):
-        # ---- 공격자 발화(반쪽 턴) ----
+        # ---- 공격자 발화 ----
         if attacks >= MAX_OFFENDER_TURNS:
             break
 
         current_step_str = steps[current_step_idx] if current_step_idx < len(steps) else ""
 
-        # 매 턴, 현재 단계(current_step)에 맞춘 system 프롬프트 구성
         attacker_system = render_attacker_system_string(
             scenario=scenario_all,
             current_step=current_step_str,
             guidance=guidance_meta,
         )
+        # ⚠️ 시스템 문자열을 템플릿 변수로 바인딩하여 { } 변수 오인 방지
         attacker_prompt = ChatPromptTemplate.from_messages([
-            ("system", attacker_system),
+            ("system", "{attacker_system}"),
             MessagesPlaceholder("history"),
             ("human", "마지막 피해자 발화(없으면 비어 있음):\n{last_victim}"),
         ])
         attacker_chain = attacker_prompt | attacker_llm
         attacker_msg = attacker_chain.invoke({
-            "history":     history_attacker,
-            "last_victim": last_victim_text,
+            "attacker_system": attacker_system,
+            "history":         history_attacker,
+            "last_victim":     last_victim_text,
         })
-        attacker_text = getattr(attacker_msg, "content", str(attacker_msg)).strip()
+        raw_attacker_text = getattr(attacker_msg, "content", str(attacker_msg)).strip()
+        attacker_text, attacker_intent = _extract_intent_and_strip(raw_attacker_text)
 
         _save_turn(
-            db,
-            case.id,
-            offender.id,
-            victim.id,
-            turn_index,
-            "offender",
-            attacker_text,
-            label=None,
-            use_agent=use_agent,
-            run=run_no,
-            guidance_type=guidance_type,
-            guideline=guidance_text,
+            db, case.id, offender.id, victim.id,
+            turn_index, "offender", attacker_text,
+            label=attacker_intent,
+            use_agent=use_agent, run=run_no,
+            guidance_type=guidance_type, guideline=guidance_text,
         )
+        json_log["turns"].append({
+            "turn_index": turn_index,
+            "role": "offender",
+            "content": attacker_text,
+            "label": attacker_intent,
+        })
         history_attacker.append(AIMessage(attacker_text))
         history_victim.append(HumanMessage(attacker_text))
         last_offender_text = attacker_text
         turn_index += 1
         attacks += 1
 
-        # 실제 단계였을 때만 커서 전진
         if current_step_idx < len(steps):
             current_step_idx += 1
 
-        # 공격자 종료 선언 시: 피해자 종료 한 줄 후 종료
         if _hit_end(attacker_text):
             if replies < MAX_VICTIM_TURNS:
                 victim_text = VICTIM_END_LINE
                 _save_turn(
-                    db,
-                    case.id,
-                    offender.id,
-                    victim.id,
-                    turn_index,
-                    "victim",
-                    victim_text,
+                    db, case.id, offender.id, victim.id,
+                    turn_index, "victim", victim_text,
                     label=None,
-                    use_agent=use_agent,
-                    run=run_no,
-                    guidance_type=guidance_type,
-                    guideline=guidance_text,
+                    use_agent=use_agent, run=run_no,
+                    guidance_type=guidance_type, guideline=guidance_text,
                 )
+                json_log["turns"].append({
+                    "turn_index": turn_index,
+                    "role": "victim",
+                    "content": victim_text,
+                    "label": None,
+                })
                 history_victim.append(AIMessage(victim_text))
                 history_attacker.append(HumanMessage(victim_text))
                 last_victim_text = victim_text
                 turn_index += 1
                 replies += 1
-            break  # 티키타카 카운트 증가 없이 종료
+            break
 
-        # ---- 피해자 발화(반쪽 턴) ----
+        # ---- 피해자 발화 ----
         if replies >= MAX_VICTIM_TURNS:
             break
 
@@ -293,39 +292,40 @@ def run_two_bot_simulation(db: Session, req: ConversationRunRequest) -> Tuple[UU
             previous_experience=previous_experience,
             is_convinced_prev=is_convinced_prev,
         )
+        # ⚠️ 동일하게 시스템 문자열을 변수로 바인딩
         victim_prompt = ChatPromptTemplate.from_messages([
-            ("system", victim_system),
+            ("system", "{victim_system}"),
             MessagesPlaceholder("history"),
             ("human", "{last_offender}"),
         ])
         victim_chain = victim_prompt | victim_llm
         victim_msg = victim_chain.invoke({
-            "history":       history_victim,
-            "last_offender": last_offender_text,
+            "victim_system":  victim_system,
+            "history":        history_victim,
+            "last_offender":  last_offender_text,
         })
         victim_text = getattr(victim_msg, "content", str(victim_msg)).strip()
 
         _save_turn(
-            db,
-            case.id,
-            offender.id,
-            victim.id,
-            turn_index,
-            "victim",
-            victim_text,
+            db, case.id, offender.id, victim.id,
+            turn_index, "victim", victim_text,
             label=None,
-            use_agent=use_agent,
-            run=run_no,
-            guidance_type=guidance_type,
-            guideline=guidance_text,
+            use_agent=use_agent, run=run_no,
+            guidance_type=guidance_type, guideline=guidance_text,
         )
+        json_log["turns"].append({
+            "turn_index": turn_index,
+            "role": "victim",
+            "content": victim_text,
+            "label": None,
+        })
         history_victim.append(AIMessage(victim_text))
         history_attacker.append(HumanMessage(victim_text))
         last_victim_text = victim_text
         turn_index += 1
         replies += 1
 
-        # 피해자 JSON에서 is_convinced 업데이트 시도(실패하면 무시)
+        # 피해자 JSON에서 is_convinced 업데이트 시도
         try:
             parsed = _json.loads(victim_text)
             if isinstance(parsed, dict) and isinstance(parsed.get("is_convinced"), int):
@@ -333,28 +333,20 @@ def run_two_bot_simulation(db: Session, req: ConversationRunRequest) -> Tuple[UU
         except Exception:
             pass
 
-        # 티키타카 1턴 완료
         turns_executed += 1
 
-    # 관리자 요약/판정 실행
+    # 관리자 요약/판정
     summarize_case(db, case.id)
+
+    # ── JSON 파일 저장 ─────────────────────────────────
+    out_dir = getattr(settings, "SIM_OUTPUT_DIR", "runs")
+    os.makedirs(out_dir, exist_ok=True)
+    fname = os.path.join(
+        out_dir,
+        f"sim_{case.id}_run{run_no}.json"
+    )
+    with open(fname, "w", encoding="utf-8") as f:
+        _json.dump(json_log, f, ensure_ascii=False, indent=2)
 
     # total_turns = 실제 '턴(티키타카)' 개수
     return case.id, turns_executed
-
-
-def advance_one_tick(
-    db: Session,
-    case_id: UUID,
-    inject: Dict[str, Any] | None = None,
-) -> List[Dict[str, Any]]:
-    rows = (
-        db.query(m.ConversationLog)
-        .filter(m.ConversationLog.case_id == case_id)
-        .order_by(m.ConversationLog.run.asc(), m.ConversationLog.turn_index.asc())
-        .all()
-    )
-    out: List[Dict[str, Any]] = []
-    for r in rows[-4:]:
-        out.append({"role": r.role, "content": r.content, "label": r.label})
-    return out
