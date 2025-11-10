@@ -104,13 +104,14 @@ export default function TerminalLog({
 
   return (
     <div
-      className={`rounded-2xl border overflow-hidden shadow-lg ${className}`}
+      className={`rounded-2xl border overflow-hidden shadow-lg flex flex-col ${className}`}
       style={{
         background: `linear-gradient(180deg, ${theme.bg} 0%, ${theme.panel} 100%)`,
         borderColor: theme.border,
         boxShadow: `0 8px 30px ${theme.black}55, inset 0 1px 0 ${theme.black}40`,
-        display: "flex",
-        flexDirection: "column",
+        // display: "flex",
+        // flexDirection: "column",
+        flex: 1,   
         height: "100%",
       }}
     >
@@ -139,9 +140,10 @@ export default function TerminalLog({
       {/* 본문 */}
       <div
         ref={wrapRef}
-        className="px-4 py-3 overflow-auto"
+        // className="px-4 py-3 overflow-auto"
+        className="flex-1 px-4 py-3 overflow-auto"
         style={{
-          height,
+          // height,
           color: theme.text,
           fontFamily:
             "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Courier New', monospace",
