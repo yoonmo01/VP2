@@ -78,7 +78,7 @@ const SimulatorPage = ({
 }) => {
   //SSE 이벤트 실행 트리거
   const {
-    logs, messages, start, running, judgement, guidance, prevention
+    logs, messages, start, running, judgements, guidances, preventions
   } = useSimStream(setMessages, {
     // 필요 시 넣을 수 있는 콜백/상태 전달 (옵션)
     addSystem,                 // 있으면 전달
@@ -105,26 +105,25 @@ const SimulatorPage = ({
 
   // guidance / prevention 도 동일 패턴으로 가드
   const normalizedGuidance = useMemo(() => {
-    const ev = guidance?.event ?? guidance;
+    const ev = guidances?.event ?? guidances;
     return ev?.content ?? ev ?? null;
-  }, [guidance]);
+  }, [guidances]);
 
   const normalizedPrevention = useMemo(() => {
-    const ev = prevention?.event ?? prevention;
+    const ev = preventions?.event ?? preventions;
     return ev?.content ?? ev ?? null;
-  }, [prevention]);
+  }, [preventions]);
 
   // 🎯 스크롤/탭/보드 상태
   const localScrollContainerRef = useRef(null);
   const scrollRef = injectedScrollContainerRef ?? localScrollContainerRef;
   const [activeAgentTab, setActiveAgentTab] = useState("log");
-
   const [showBoardContent, setShowBoardContent] = useState(false);
 
   // 1️⃣ 분석 데이터 준비 여부 체크
-  const hasJudgement = Boolean(judgement && (judgement.content ?? judgement));
-  const hasGuidance  = Boolean(guidance && (guidance.content ?? guidance));
-  const hasPrevention = Boolean(prevention && (prevention.content ?? prevention));
+  const hasJudgement = judgements.length > 0;
+  const hasGuidance = guidances.length > 0;
+  const hasPrevention = preventions.length > 0;
   const hasAnyAgentData = hasJudgement || hasGuidance || hasPrevention;
 
   // 2️⃣ 데이터가 오면 자동으로 보드 활성화
@@ -225,7 +224,7 @@ const SimulatorPage = ({
   };
   // judgement 구조가 {type:'judgement', event:{...}} 일 수도/아닐 수도 있으니 통합
   const normalizedJudgement = useMemo(() => {
-    const ev = judgement?.event ?? judgement;
+    const ev = judgements?.event ?? judgements;
     const raw = ev?.content ?? ev;
     if (!raw || typeof raw !== "object") return null;
     return {
@@ -239,15 +238,15 @@ const SimulatorPage = ({
       ok: raw.ok,
       persisted: raw.persisted,
     };
-  }, [judgement]);
+  }, [judgements]);
 
   // ✅ applied_guidance 추출
   const appliedGuidance = useMemo(() => {
     return (
-      judgement?.meta?.scenario?.enhancement_info?.applied_guidance ??
+      judgements?.meta?.scenario?.enhancement_info?.applied_guidance ??
       "지침 데이터 없음"
     );
-  }, [judgement]);
+  }, [judgements]);
 
   // 진행률 계산에 쓰는 로컬 카운터(선언을 hasChatLog보다 위에 둠)
   const countChatMessagesLocal = (msgs = []) =>
@@ -770,38 +769,38 @@ const SimulatorPage = ({
                       </div>
 
                       <div className="flex-1 overflow-auto p-4">
-  {activeAgentTab === "log" ? (
-    <TerminalLog logs={logs} COLORS={THEME} />
-  ) : showBoardContent && (judgement || guidance || prevention) ? (
-    <div className="flex flex-col gap-4">
-      {/* ✅ InvestigationBoard 단일 호출 */}
-      <InvestigationBoard
-        COLORS={THEME}
-        judgement={judgement}
-        guidance={guidance}
-        prevention={prevention}
-      />
+                        {activeAgentTab === "log" ? (
+                          <TerminalLog logs={logs} COLORS={THEME} />
+                        ) : showBoardContent && (hasJudgement || hasGuidance || hasPrevention) ? (
+                          <div className="flex flex-col gap-4">
+                            {/* ✅ InvestigationBoard 단일 호출 */}
+                            <InvestigationBoard
+                              COLORS={THEME}
+                              judgements={judgements}
+                              guidances={guidances}
+                              preventions={preventions}
+                            />
 
-      {/* (선택) 원본 데이터 확인용 JSON 블록 */}
-      {judgement && (
-        <JsonBlock title="[SSE Event] judgement (raw)" obj={judgement} theme={THEME} />
-      )}
-      {guidance && (
-        <JsonBlock title="[SSE Event] guidance (raw)" obj={guidance} theme={THEME} />
-      )}
-      {prevention && (
-        <JsonBlock title="[SSE Event] prevention (raw)" obj={prevention} theme={THEME} />
-      )}
-    </div>
-  ) : (
-    <div
-      className="p-4 text-sm opacity-70"
-      style={{ color: THEME.sub }}
-    >
-      분석 데이터를 불러오는 중입니다...
-    </div>
-  )}
-</div>
+                            {/* (선택) 원본 데이터 확인용 JSON 블록 */}
+                            {judgements && (
+                              <JsonBlock title="[SSE Event] judgements (raw)" obj={judgements} theme={THEME} />
+                            )}
+                            {guidances && (
+                              <JsonBlock title="[SSE Event] guidances (raw)" obj={guidances} theme={THEME} />
+                            )}
+                            {preventions && (
+                              <JsonBlock title="[SSE Event] preventions (raw)" obj={preventions} theme={THEME} />
+                            )}
+                          </div>
+                        ) : (
+                          <div
+                            className="p-4 text-sm opacity-70"
+                            style={{ color: THEME.sub }}
+                          >
+                            분석 데이터를 불러오는 중입니다...
+                          </div>
+                        )}
+                    </div>
                     </div>
                   </div>
                 </>

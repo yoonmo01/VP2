@@ -1,5 +1,5 @@
 // src/components/InvestigationBoard.jsx
-import React, { useEffect, useState, useMemo } from "react";
+import React from "react";
 import { Shield, Target, Lightbulb, TrendingUp } from "lucide-react";
 
 /*== 색상 토큰 ==*/
@@ -17,6 +17,31 @@ const DEFAULT_THEME = {
   purple: "#A855F7",
   cyan: "#06B6D4",
 };
+
+/* ============================================================
+   1) 🔵 핵심: 모든 judgement/guidance/prevention 구조를 통일
+===============================================================*/
+function normalizeRound(obj) {
+  if (!obj) return null;
+
+  const content = obj.content ?? obj.event?.content ?? {};
+  const meta = obj.meta ?? obj.raw ?? {};
+
+  const round_no =
+    content.run_no ??
+    meta.round_no ??
+    obj.run_no ??
+    obj.round ??
+    obj.meta?.round_no ??
+    null;
+
+  return {
+    ...obj,
+    ...meta,
+    ...content,
+    round_no,
+  };
+}
 
 /*== 위험도 스타일 ==*/
 const getRiskStyle = (level) => {
@@ -46,19 +71,25 @@ function Section({ icon: Icon, title, color, children, badge }) {
   );
 }
 
-/*== 라운드별 피싱 판정 블록 ==*/
+/*== RoundBlock ==*/
 function RoundBlock({ conv, theme }) {
-  const { run_no, phishing, evidence, risk, victim_vulnerabilities = [] } = conv || {};
+  if (!conv) return null;
+
+  const {
+    run_no,
+    phishing,
+    evidence,
+    risk,
+    victim_vulnerabilities = [],
+  } = conv;
+
   const riskStyle = getRiskStyle(risk?.level);
   const riskScore = risk?.score ?? 0;
 
   return (
     <div
       className="rounded-xl p-6 mb-6"
-      style={{
-        backgroundColor: theme.panel,
-        border: `1px solid ${theme.border}`,
-      }}
+      style={{ backgroundColor: theme.panel, border: `1px solid ${theme.border}` }}
     >
       {/* 헤더 */}
       <div
@@ -89,7 +120,7 @@ function RoundBlock({ conv, theme }) {
         </div>
       </div>
 
-      {/* 피싱 판정 결과 */}
+      {/* 피싱 판정 */}
       <Section icon={Shield} title="피싱 판정 결과" color={theme.blurple}>
         <p className="text-sm leading-relaxed" style={{ color: theme.sub }}>
           {evidence || "근거 없음"}
@@ -130,41 +161,8 @@ function RoundBlock({ conv, theme }) {
               />
             </div>
             <p className="text-sm leading-relaxed" style={{ color: theme.sub }}>
-              {risk.rationale}
+              {risk?.rationale}
             </p>
-          </div>
-        </Section>
-      )}
-
-      {/* 취약 요인 */}
-      {victim_vulnerabilities.length > 0 && (
-        <Section
-          icon={Target}
-          title="피해자 취약 요인"
-          color={theme.warn}
-          badge={
-            <span
-              className="px-2 py-0.5 rounded text-xs font-bold"
-              style={{ backgroundColor: "#F59E0B20", color: theme.warn }}
-            >
-              {victim_vulnerabilities.length}
-            </span>
-          }
-        >
-          <div className="space-y-2">
-            {victim_vulnerabilities.map((v, i) => (
-              <div key={i} className="flex gap-3">
-                <span
-                  className="w-5 h-5 rounded flex items-center justify-center flex-shrink-0 text-xs font-bold"
-                  style={{ backgroundColor: "#F59E0B20", color: theme.warn }}
-                >
-                  {i + 1}
-                </span>
-                <p className="text-sm leading-relaxed" style={{ color: theme.sub }}>
-                  {v}
-                </p>
-              </div>
-            ))}
           </div>
         </Section>
       )}
@@ -172,35 +170,54 @@ function RoundBlock({ conv, theme }) {
   );
 }
 
-/*== 라운드별 GuidanceGeneration 블록 ==*/
+/*== GuidanceBlock ==*/
 function GuidanceBlock({ guidance, theme }) {
   if (!guidance) return null;
 
-  const normalized = guidance?.content
-    ? { text: guidance.content, ...guidance }
-    : guidance || {};
+  const text = guidance.text ?? guidance.content;
+  const categories = guidance.categories ?? [];
+  const reasoning = guidance.reasoning;
+  const expected_effect = guidance.expected_effect;
 
-  const guidanceText = normalized.text;
-  const categories = normalized.categories || [];
-  const reasoning = normalized.reasoning;
-  const expectedEffect = normalized.expected_effect;
+  const TOOLTIP_MAP = {
+    A: "어휘/어조 조절: 피해자 수준에 맞는 언어 사용",
+    B: "긴급성 강조: 시간 압박을 통한 판단력 흐림",
+    C: "감정적 접근: 두려움, 책임감, 걱정 자극",
+    D: "전문성 연출: 용어, 절차, 공식성 강조",
+    E: "점진적 요구: 단계별 정보 수집 전략",
+    F: "의심 무마: 보안 우려 해소, 정당성 강조",
+    G: "사칭 다변화: 인물/기관 변경으로 신뢰성 증대",
+    H: "수법 복합화: 여러 피싱 기법 조합 활용",
+    I: "심리적 압박: 위협, 협박을 통한 강제성",
+    J: "격리 및 통제: 외부 접촉 차단, 물리적/심리적 고립 유도",
+    K: "카드배송-검사사칭 연계형: 카드기사 사칭 → 가짜센터 연결 → 원격제어 앱 유도",
+    L: "납치빙자형 극단적 공포: 가족 음성 모방 + 협박으로 즉시 송금 유도",
+    M: "홈캠 해킹 협박형: 사생활 노출 위협 + 개인정보 활용",
+    N: "공신력 기관 사칭: 정부·시청·군부대 등 명분으로 선입금 유도",
+    O: "가족사칭 정보수집: 비밀번호 설정 도움 명목으로 정보 탈취",
+    P: "허위계약서 작성유도: 검사 사칭 → 계약서로 해제 유도",
+    Q: "국세청 사칭 세무협박: 세금 미납·포탈 위협으로 송금 유도",
+    R: "격리형 장기통제: 보호조사 명목으로 고립 및 통제",
+    S: "권위 편향 활용: 금융기관/전문가 신분으로 신뢰 유도",
+    T: "손실 회피 심리: 채무 해결/금리 인하 제시로 절박함 자극",
+    U: "희소성 효과 조성: ‘오늘만’ 등으로 즉흥 결정 유도",
+    V: "휴리스틱 의존 악용: 익숙한 절차·패턴으로 의심 차단",
+    W: "2차 피해 암시: 비협조 시 추가 피해 암시로 압박",
+  };
 
   return (
     <div
       className="rounded-xl p-6 mb-10"
-      style={{
-        backgroundColor: theme.panelDark,
-        border: `1px solid ${theme.border}`,
-      }}
+      style={{ backgroundColor: theme.panelDark, border: `1px solid ${theme.border}` }}
     >
-      <Section icon={Lightbulb} title="공격 지침 (GuidanceGeneration)" color={theme.purple}>
+      <Section icon={Lightbulb} title="공격 지침 (Guidance)" color={theme.purple}>
         <div className="space-y-3">
           {categories.length > 0 && (
             <div className="flex flex-wrap gap-2 mb-3">
               {categories.map((cat, i) => (
                 <span
                   key={i}
-                  className="px-2 py-1 rounded text-xs font-mono font-bold"
+                  className="relative group px-2 py-1 rounded text-xs font-mono font-bold"
                   style={{
                     backgroundColor: "#A855F720",
                     color: theme.purple,
@@ -208,13 +225,24 @@ function GuidanceBlock({ guidance, theme }) {
                   }}
                 >
                   {cat}
+                  <div
+                    className="absolute hidden group-hover:block bottom-full left-1/2 -translate-x-1/2 mb-2 px-2 py-1 rounded text-[11px]"
+                    style={{
+                      backgroundColor: theme.panel,
+                      color: theme.text,
+                      border: `1px solid ${theme.border}`,
+                      whiteSpace: "nowrap",
+                    }}
+                  >
+                    {TOOLTIP_MAP[cat]}
+                  </div>
                 </span>
               ))}
             </div>
           )}
 
           <p className="text-sm leading-relaxed" style={{ color: theme.sub }}>
-            {guidanceText}
+            {text}
           </p>
 
           {reasoning && (
@@ -225,7 +253,7 @@ function GuidanceBlock({ guidance, theme }) {
                 borderLeft: `2px solid ${theme.cyan}`,
               }}
             >
-              <div className="text-xs mb-1 font-medium" style={{ color: theme.cyan }}>
+              <div className="text-xs mb-1" style={{ color: theme.cyan }}>
                 추론 과정
               </div>
               <p className="text-xs leading-relaxed" style={{ color: theme.sub }}>
@@ -234,7 +262,7 @@ function GuidanceBlock({ guidance, theme }) {
             </div>
           )}
 
-          {expectedEffect && (
+          {expected_effect && (
             <div
               className="p-3 rounded-lg"
               style={{
@@ -242,11 +270,11 @@ function GuidanceBlock({ guidance, theme }) {
                 borderLeft: `2px solid ${theme.success}`,
               }}
             >
-              <div className="text-xs mb-1 font-medium" style={{ color: theme.success }}>
+              <div className="text-xs mb-1" style={{ color: theme.success }}>
                 예상 효과
               </div>
               <p className="text-xs leading-relaxed" style={{ color: theme.sub }}>
-                {expectedEffect}
+                {expected_effect}
               </p>
             </div>
           )}
@@ -256,78 +284,50 @@ function GuidanceBlock({ guidance, theme }) {
   );
 }
 
-/*== 메인 컴포넌트 ==*/
-export default function InvestigationBoard({ COLORS, judgement, guidance, prevention }) {
+/* ============================================================
+   ⭐ 메인 InvestigationBoard
+===============================================================*/
+export default function InvestigationBoard({
+  COLORS,
+  judgements = [],
+  guidances = [],
+  preventions = [],
+}) {
   const theme = { ...DEFAULT_THEME, ...(COLORS || {}) };
-  const [roundData, setRoundData] = useState([]);
 
-  const mergeRoundData = (type, data) => {
-    const runNo = data?.run_no ?? data?.meta?.round_no ?? 1;
-    setRoundData((prev) => {
-      const existing = prev.find((r) => r.run_no === runNo) || { run_no: runNo };
-      const updated = {
-        ...existing,
-        run_no: runNo,
-        phishing: data?.phishing ?? data?.content?.phishing ?? existing.phishing,
-        evidence: data?.evidence ?? data?.content?.evidence ?? existing.evidence,
-        risk: data?.risk ?? data?.content?.risk ?? existing.risk,
-        victim_vulnerabilities:
-          data?.victim_vulnerabilities ??
-          data?.content?.victim_vulnerabilities ??
-          existing.victim_vulnerabilities ??
-          [],
-        guidance: type === "guidance" ? data : existing.guidance,
-        prevention: type === "prevention" ? data : existing.prevention,
-      };
-      const newList = prev.filter((r) => r.run_no !== runNo).concat(updated);
-      return newList.sort((a, b) => (a.run_no ?? 0) - (b.run_no ?? 0));
+  // 🔵 모든 raw 데이터를 normalize(라운드 번호 통일)
+  const J = judgements.map(normalizeRound);
+  const G = guidances.map(normalizeRound);
+  const P = preventions.map(normalizeRound);
+
+  const rounds = [];
+
+  J.forEach((j) => {
+    if (!j.round_no) return;
+
+    rounds.push({
+      round_no: j.round_no,
+      judgement: j,
+      guidance: G.find((g) => g.round_no === j.round_no),
+      prevention: P.find((p) => p.round_no === j.round_no),
     });
-  };
+  });
 
-  useEffect(() => {
-    if (judgement) {
-      const data = judgement.content || judgement;
-      mergeRoundData("judgement", data);
-    }
-  }, [judgement]);
-
-  useEffect(() => {
-    if (guidance) {
-      const runNo =
-        guidance?.meta?.round_no ??
-        guidance?.run_no ??
-        (roundData.length > 0 ? roundData[roundData.length - 1].run_no + 1 : 1);
-      mergeRoundData("guidance", { ...guidance, run_no: runNo });
-    }
-  }, [guidance]);
-
-  useEffect(() => {
-    if (prevention) {
-      const data = prevention.content || prevention;
-      mergeRoundData("prevention", data);
-    }
-  }, [prevention]);
+  rounds.sort((a, b) => a.round_no - b.round_no);
 
   return (
     <div className="h-full overflow-y-auto p-6" style={{ backgroundColor: theme.bg }}>
-      {judgement && <RoundBlock conv={judgement} theme={theme} />}
-      {guidance && <GuidanceBlock guidance={guidance} theme={theme} />}
-      {prevention && (
-        <div
-          className="rounded-xl p-6 mb-6"
-          style={{ backgroundColor: theme.panelDark, border: `1px solid ${theme.border}` }}
-        >
-          <Section icon={Shield} title="예방 정보 (Prevention)" color={theme.success}>
-            <p className="text-sm leading-relaxed" style={{ color: theme.sub }}>
-              {JSON.stringify(prevention, null, 2)}
-            </p>
-          </Section>
+      {rounds.map((r, idx) => (
+        <div key={`round-${idx}`}>
+          <RoundBlock conv={r.judgement} theme={theme} />
+          {r.guidance && (
+            <GuidanceBlock guidance={r.guidance} theme={theme} />
+          )}
         </div>
-      )}
+      ))}
     </div>
   );
 }
-
 
 // // src/components/InvestigationBoard.jsx
 // import React, { useEffect, useState, useMemo } from "react";
