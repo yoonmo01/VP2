@@ -784,7 +784,7 @@ def build_agent_and_tools(db: Session, use_tavily: bool) -> Tuple[AgentExecutor,
 
     agent = create_react_agent(llm=llm, tools=tools, prompt=prompt)
     ex = AgentExecutor(
-        agent=agent, tools=tools, verbose=True, handle_parsing_errors=_parsing_error_handler, max_iterations=8
+        agent=agent, tools=tools, verbose=True, handle_parsing_errors=_parsing_error_handler, max_iterations=5
     )
     return ex, mcp_manager
 
