@@ -36,6 +36,9 @@ export function useSimStream(
   const totalRoundsRef = useRef(5);
   const seenTurnsRef = useRef(new Set());
 
+  const lastRoundRef = useRef(null);
+  lastRoundRef.current = null;
+  
   const stripAnsi = (s = "") => String(s).replace(/\x1B\[[0-9;]*m/g, "");
   const containsFinishedChain = (text = "") => /\bFinished chain\b/i.test(stripAnsi(text));
 
@@ -127,9 +130,36 @@ export function useSimStream(
           // ──────────────────────────────
           if (type === "conversation_log") {
             console.log("🎯 conversation_log 감지!", evt);
-
             const logData = typeof evt === "object" ? evt : event?.content;
             const turns = logData?.turns || logData?.log?.turns || [];
+
+            // ⭐ 현재 라운드 번호 감지
+            const roundNo =
+              logData?.round_no ||
+              logData?.run_no ||
+              logData?.meta?.round_no ||
+              logData?.meta?.run_no ||
+              null;
+
+            // ⭐ 라운드가 바뀌었으면 라운드 박스 메시지 시스템으로 삽입
+            if (roundNo !== null && lastRoundRef.current !== roundNo) {
+              lastRoundRef.current = roundNo;
+
+              const dividerMsg = {
+                type: "system",
+                sender: "system",
+                role: "system",
+                isRoundDivider: true, // ⭐ 라운드 구분용 플래그
+                round: roundNo,
+                text: "",             // 대화 내용은 비워둠
+                content: "",
+                side: "center",
+                timestamp: new Date().toISOString(),
+              };
+
+              setLocalMessages(prev => [...prev, dividerMsg]);
+              setMessages?.(prev => [...prev, dividerMsg]);
+            }
 
             if (Array.isArray(turns) && turns.length > 0) {
               setSimulationState?.("RUNNING");
