@@ -21,7 +21,7 @@ class SimulationInput(BaseModel):
     offender_id: int
     victim_id: int
     scenario: Dict[str, Any] = {}
-    victim_profile: Dict[str, Any] = {}
+    victim_profile: Optional[Dict[str, Any]] = {}
     templates: Dict[str, Any] = {}
     models: Dict[str, str] = Field(default_factory=dict)
     temperature: float = 0.6

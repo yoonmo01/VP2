@@ -3,7 +3,7 @@ import json
 import asyncio
 from typing import Optional
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Request, Query
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
@@ -22,7 +22,7 @@ async def simulate_stream(
     offender_id: int,
     victim_id: int,
     max_turns: int = 15,
-    round_limit: int = 5,
+    round_limit: int = Query(3, ge=2, le=3),
     case_id: Optional[str] = None,
     use_tavily: bool = False,
     stream_id: Optional[str] = None,   # 기본값 있는 인자는 뒤쪽

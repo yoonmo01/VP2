@@ -44,24 +44,109 @@ class SingleData(BaseModel):
     data: Any = Field(..., description="이 안에 실제 페이로드를 담는다")
 
 def _to_dict(obj: Any) -> Dict[str, Any]:
+    """
+    admin.* 툴에 들어오는 data를 dict로 정규화.
+    - dict면 그대로 사용
+    - str이면 JSON / literal / "data": { ... } 블록만 뽑아서 파싱
+    """
     if hasattr(obj, "model_dump"):
         obj = obj.model_dump()
+
     if isinstance(obj, dict):
         return obj
-    if isinstance(obj, str):
-        s = obj.strip()
+
+    if not isinstance(obj, str):
+        raise HTTPException(status_code=422, detail="data는 JSON 객체여야 합니다.")
+
+    s = obj.strip()
+    logger.info("[admin.make_judgement] _to_dict raw string: %r", s)
+
+    def _try_parse(candidate: str) -> Optional[Dict[str, Any]]:
+        candidate = candidate.strip()
+        if not candidate:
+            return None
+        # JSON 우선
         try:
-            return json.loads(s)
+            v = json.loads(candidate)
+            if isinstance(v, dict):
+                return v
         except Exception:
-            try:
-                return ast.literal_eval(s)
-            except Exception:
-                raise HTTPException(status_code=422, detail="data는 JSON 객체여야 합니다.")
+            pass
+        # literal_eval 보조
+        try:
+            v = ast.literal_eval(candidate)
+            if isinstance(v, dict):
+                return v
+        except Exception:
+            pass
+        return None
+
+    # 1) 전체 문자열에 대해 JSON 시도
+    val = _try_parse(s)
+    if val is not None:
+        return val
+
+    # 2) "data" 키 이후의 {...} 블록만 골라서 다시 JSON 만들기
+    idx = s.find('"data"')
+    if idx != -1:
+        # "data" 뒤 첫 '{' 위치 찾기
+        brace_start = s.find("{", idx)
+        if brace_start != -1:
+            depth = 0
+            end = None
+            for i, ch in enumerate(s[brace_start:], start=brace_start):
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        end = i
+                        break
+            if end is not None:
+                # data 값만 잘라내서 다시 {"data": <여기>} 형태의 JSON으로 감싸기
+                inner = s[brace_start:end+1]
+                logger.info("[admin.make_judgement] _to_dict extracted data block: %r", inner)
+                wrapped = '{"data":' + inner + '}'
+                val = _try_parse(wrapped)
+                if val is not None:
+                    return val
+
+    # 3) 그래도 안 되면, 기존처럼 가장 큰 { .. } 블록 + 끝의 ] 잘라내기 시도
+    m = re.search(r"\{.*\}", s, re.S)
+    if m:
+        sub = m.group(0)
+        val = _try_parse(sub)
+        if val is not None:
+            return val
+
+    tmp = s
+    for _ in range(5):
+        if not tmp.rstrip().endswith("]"):
+            break
+        tmp = tmp.rstrip()[:-1].rstrip()
+        val = _try_parse(tmp)
+        if val is not None:
+            logger.warning("[admin._to_dict] fixed extra trailing ']' in data")
+            return val
+
     raise HTTPException(status_code=422, detail="data는 JSON 객체여야 합니다.")
 
+
 def _unwrap_data(obj: Any) -> Dict[str, Any]:
+    """
+    SingleData(data=...) 구조를 풀어서 실제 payload(dict)를 반환.
+    - {"case_id": "...", "run_no": 1, ...}
+    - {"data": {...}}
+    - 'Action Input: {"data":{...}}'
+    전부 허용.
+    """
     d = _to_dict(obj)
-    return _to_dict(d.get("data")) if "data" in d else d
+
+    inner = d.get("data")
+    if isinstance(inner, dict):
+        return inner
+
+    return d
 
 def _normalize_kind(val: Any) -> str:
     if isinstance(val, str):
@@ -393,6 +478,7 @@ def make_admin_tools(db: Session, guideline_repo):
         description="(case_id, run_no)의 전체 대화를 MCP JSON 또는 전달받은 turns로 판정한다. DB는 결과 저장에만 사용한다."
     )
     def make_judgement(data: Any) -> Dict[str, Any]:
+        logger.info("[admin.make_judgement] raw data type=%s repr=%r", type(data), data)
         payload = _unwrap_data(data)
         try:
             ji = _JudgeMakeInput(**payload)

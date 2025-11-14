@@ -36,7 +36,12 @@ EXPECT_GUIDANCE_KEY = "type"   # ← 서버가 kind를 요구하면 "kind"로 �
 
 # mcp.simulator_run은 Action Input 최상위 언랩을 사용
 EXPECT_MCP_DATA_WRAPPER = False  # True면 {"data": {...}} 래핑, False면 언랩
-
+# ─────────────────────────────────────────────────────────
+# 라운드 정책 상수
+# ─────────────────────────────────────────────────────────
+MIN_ROUNDS = 2            # 전체 설계 최소 라운드
+MAX_ROUNDS_DEFAULT = 5    # 전체 설계 기본 최대 라운드
+MAX_ROUNDS_UI_LIMIT = 3   # ⬅️ 현재 UI 때문에 임시로 3으로 제한 (나중에 5로만 바꾸면 됨)
 # (SSE) 필요한 모듈
 import asyncio, logging, uuid, contextvars, contextlib, sys
 from threading import Event as ThreadEvent
@@ -784,7 +789,7 @@ def build_agent_and_tools(db: Session, use_tavily: bool) -> Tuple[AgentExecutor,
 
     agent = create_react_agent(llm=llm, tools=tools, prompt=prompt)
     ex = AgentExecutor(
-        agent=agent, tools=tools, verbose=True, handle_parsing_errors=_parsing_error_handler, max_iterations=5
+        agent=agent, tools=tools, verbose=True, handle_parsing_errors=True, max_iterations=20
     )
     return ex, mcp_manager
 
@@ -861,14 +866,19 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
             offender_id = int(req.offender_id or 0)
             victim_id = int(req.victim_id or 0)
 
-            # 라운드 정책: 최소 2, 최대 req.round_limit(기본 5). 종료는 오직 critical 또는 max_rounds 도달 시.
-            min_rounds = 2
+            # 라운드 정책
+            # - 전체 설계: 최소 2, 최대 5
+            # - 현재 UI 제약: 실제로는 최소 2, 최대 3까지만 허용
             try:
-                max_rounds = int(getattr(req, "round_limit", 3) or 3)
+                requested_rounds = int(getattr(req, "round_limit", MAX_ROUNDS_DEFAULT) or MAX_ROUNDS_DEFAULT)
             except Exception:
-                max_rounds = 3
-            if max_rounds < min_rounds:
-                max_rounds = min_rounds
+                requested_rounds = MAX_ROUNDS_DEFAULT
+
+            # 1) 설계 상 최소 라운드 보장 (2 이상)
+            requested_rounds = max(MIN_ROUNDS, requested_rounds)
+
+            # 2) 현재 UI 상한으로 클램프 (지금은 3, 나중에 5로 수정만 하면 됨)
+            max_rounds = min(requested_rounds, MAX_ROUNDS_UI_LIMIT)
 
             guidance_kind: Optional[str] = None
             guidance_text: Optional[str] = None
@@ -1375,7 +1385,7 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
                         prevention_created = True
                         logger.info("[Prevention] prevention_created set True for case_id=%s", case_id)
                         # ✅ 여기서 '최종예방책 생성 완료' 전용 신호 송신
-                        _emit_to_stream("chain_finished", {
+                        _emit_to_stream("finished_chain", {
                             "case_id": case_id,
                             "rounds": rounds_done,
                             "finished_reason": finished_reason,  # "critical" | "rounds_exhausted"

@@ -1,7 +1,7 @@
 # app/services/agent/tools_mcp.py
 from __future__ import annotations
 from typing import Any, Dict, Optional, Literal
-import os, json
+import os, json, ast
 from json import JSONDecoder
 import httpx
 from pydantic import BaseModel, Field, ValidationError
@@ -35,7 +35,7 @@ class MCPRunInput(BaseModel):
     offender_id: int
     victim_id: int
     scenario: Dict[str, Any]
-    victim_profile: Dict[str, Any]
+    victim_profile: Optional[Dict[str, Any]] = None
 
     # templates: dict 혹은 미제공 시 기본값
     templates: Templates = Field(
@@ -193,6 +193,22 @@ def make_mcp_tools():
                 "error": "Invalid Action Input for mcp.simulator_run",
                 "pydantic_errors": json.loads(ve.json()),
             }
+        scenario: Dict[str, Any] = model.scenario or {}
+        victim_profile: Optional[Dict[str, Any]] = model.victim_profile
+
+        # top-level victim_profile이 없으면 scenario 안에서 끌어오기
+        if victim_profile is None and isinstance(scenario, dict):
+            vp = scenario.get("victim_profile")
+            if isinstance(vp, dict):
+                victim_profile = vp
+
+        # 그래도 없으면 에러 리턴 (ReAct가 학습하도록 메시지도 명확히)
+        if victim_profile is None:
+            return {
+                "ok": False,
+                "error": "missing_victim_profile",
+                "message": "victim_profile이 필요합니다. scenario.victim_profile 또는 top-level victim_profile 중 하나는 있어야 합니다.",
+            }
 
         # ---------- 3) 모델 키 정규화 ----------
         eff_models: Dict[str, str] = {}
@@ -212,7 +228,7 @@ def make_mcp_tools():
         if not atk_system:
             try:
                 atk_system = render_attacker_system_string(
-                    scenario=model.scenario or {},
+                    scenario=scenario,
                     current_step="",
                     guidance=(model.guidance.model_dump() if model.guidance else None),
                 )
@@ -223,7 +239,7 @@ def make_mcp_tools():
         if not vic_system:
             try:
                 vic_system = render_victim_system_string(
-                    victim_profile=model.victim_profile or {},
+                    victim_profile=victim_profile or {},
                     round_no=int(model.round_no or 1),
                     previous_experience="",
                     is_convinced_prev=None,
@@ -254,8 +270,8 @@ def make_mcp_tools():
         args: Dict[str, Any] = {
             "offender_id": model.offender_id,
             "victim_id": model.victim_id,
-            "scenario": model.scenario,
-            "victim_profile": model.victim_profile,
+            "scenario": scenario,
+            "victim_profile": victim_profile,
             "templates": templates_payload,  # ← 우리가 만든 system 문자열만 전달
             "max_turns": model.max_turns,
         }
