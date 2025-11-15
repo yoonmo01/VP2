@@ -1,6 +1,6 @@
 // src/MessageBubble.jsx
 import { useEffect, useState } from "react";
-import { MessageSquareText , Brain, Box, Circle, Minus } from "lucide-react";  // ⭐ 라운드 구분용 아이콘
+import { MessageCircleMore  , Brain, Box, Circle, Minus } from "lucide-react";  // ⭐ 라운드 구분용 아이콘
 
 function getRiskColors(pct) {
   const v = Math.max(0, Math.min(100, Number(pct) || 0));

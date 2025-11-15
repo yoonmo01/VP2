@@ -365,6 +365,8 @@ const normalizeMessage = (m) => {
     text: "#FFFFFF",
     sub: "#BFB38A",
     blurple: "#A8862A",
+    danger: "#ff4d4f",
+    warn: "#facc15",
   };
 
   // 진행률 계산
@@ -489,7 +491,7 @@ const normalizeMessage = (m) => {
               </Badge>
             </div>
 
-            <button
+            {/* <button
               onClick={handleGoHome}
               className="px-3 py-2 rounded-md text-sm font-medium flex items-center gap-2 border"
               style={{
@@ -500,7 +502,7 @@ const normalizeMessage = (m) => {
             >
               <Home size={16} />
               홈으로
-            </button>
+            </button> */}
           </div>
 
           {/* 메인 */}
@@ -913,6 +915,19 @@ const normalizeMessage = (m) => {
                 리포트 보기
               </button>
             )}
+
+            {progress >= 100 && (
+              <button
+                onClick={() => setOpenTTS(true)}
+                className="px-4 py-2 rounded-lg text-sm font-semibold"
+                style={{
+                  backgroundColor: THEME.blurple,
+                  color: THEME.white,
+                }}
+              >
+                음성 듣기
+              </button>
+            )}
           </div>
         </div>
       </div>
@@ -923,13 +938,14 @@ const normalizeMessage = (m) => {
         onClose={() => setOpenTTS(false)}
         COLORS={THEME}
       />
-      <CustomScenarioModal
+
+      {/* <CustomScenarioModal
         open={showCustomModal}
         onClose={() => setShowCustomModal(false)}
         onSave={handleSaveCustomScenario}
         COLORS={THEME}
         selectedTag={selectedTag}
-      />
+      /> */}
     </div>
   );
 };
