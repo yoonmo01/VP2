@@ -21,6 +21,7 @@ const ReportPage = ({
   // 🔴 SSE에서 바로 오는 데이터들
   preventions = null,   // 마지막 prevention 이벤트 or 배열
   judgements = null,    // (선택) judgement SSE 이벤트
+  streamLogs = [],   // ✅ 추가
 
   // 🔹 아래 네 개는 있으면 쓰고, 없으면 무시하도록 기본값 no-op
   setSelectedScenario = () => {},
@@ -45,6 +46,32 @@ const ReportPage = ({
     danger: COLORS?.danger ?? "#ED4245",
   };
 
+  // 🔍 SSE 로그에서 Final Answer / 최종 예방 요약 텍스트 추출
+  const finalAnswerText = useMemo(() => {
+    if (!Array.isArray(streamLogs) || streamLogs.length === 0) return null;
+
+    // 여러 줄 로그를 하나로 합치고 ANSI 코드 제거
+    const joined = streamLogs.join("\n");
+    const cleaned = joined.replace(/\x1B\[[0-9;]*m/g, "");
+
+    // 1) "Final Answer:" 부터 잘라서 사용
+    const faIdx = cleaned.indexOf("Final Answer:");
+    if (faIdx >= 0) {
+      return cleaned.slice(faIdx).trim();
+    }
+
+    // 2) 아니면 "최종 예방 요약:" 부터라도 사용
+    const sumIdx = cleaned.indexOf("최종 예방 요약:");
+    if (sumIdx >= 0) {
+      return cleaned.slice(sumIdx).trim();
+    }
+
+    // 3) 그래도 없으면 전체 로그라도 반환 (없으면 null)
+    const trimmed = cleaned.trim();
+    return trimmed.length > 0 ? trimmed : null;
+  }, [streamLogs]);
+
+
   // 🧠 1) judgement SSE 정규화
   const normalizedJudgement = useMemo(() => {
     if (!judgements) return null;
@@ -65,25 +92,6 @@ const ReportPage = ({
     };
   }, [judgements]);
 
-  // 🧠 2) 피싱 여부 계산 (judgement → sessionResult 우선순위)
-  const casePhishing = useMemo(() => {
-    const fromJudgement =
-      typeof normalizedJudgement?.phishing === "boolean"
-        ? normalizedJudgement.phishing
-        : undefined;
-
-    const fromSessionPhishing =
-      typeof sessionResult?.phishing === "boolean"
-        ? sessionResult.phishing
-        : undefined;
-
-    const fromSessionIs =
-      typeof sessionResult?.isPhishing === "boolean"
-        ? sessionResult.isPhishing
-        : undefined;
-
-    return fromJudgement ?? fromSessionPhishing ?? fromSessionIs ?? false;
-  }, [normalizedJudgement, sessionResult]);
 
   // 🧠 3) 피싱 근거 계산 (judgement → defaultCaseData → sessionResult)
   const caseEvidence = useMemo(() => {
@@ -395,33 +403,9 @@ const ReportPage = ({
                 </div>
               </div>
 
-              AI 에이전트
-              <div
-                className="rounded-2xl p-8"
-                style={{
-                  backgroundColor: THEME.panel,
-                  border: `1px solid ${THEME.border}`,
-                }}
-              >
-                <h2
-                  className="text-2xl font-semibold mb-5 flex items-center"
-                  style={{ color: THEME.text }}
-                >
-                  <Bot className="mr-3" size={26} />
-                  AI 에이전트
-                </h2>
-                <div className="flex items-center gap-4">
-                  <Badge
-                    tone={sessionResult?.agentUsed ? "success" : "neutral"}
-                    COLORS={THEME}
-                  >
-                    {sessionResult?.agentUsed ? "사용" : "미사용"}
-                  </Badge>
-                </div>
-              </div>
-            </div>
 
             {/* 오른쪽: 판정 결과 / 예방법 / 출처 */}
+            </div>
             <div className="flex-1 min-h-0 overflow-y-auto space-y-8 pr-2">
               {/* 피싱 판정 결과 */}
               <div
@@ -440,16 +424,7 @@ const ReportPage = ({
                     피싱 판정 결과
                   </h2>
 
-                  <div className="ml-4">
-                    <Badge
-                      tone={casePhishing ? "primary" : "danger"}
-                      COLORS={THEME}
-                    >
-                      {casePhishing ? "피싱 성공" : "피싱 실패"}
-                    </Badge>
-                  </div>
                 </div>
-
                 <div
                   className="mt-2 p-4 rounded"
                   style={{
@@ -459,13 +434,13 @@ const ReportPage = ({
                   }}
                 >
                   <h4 className="font-semibold mb-2">
-                    {casePhishing ? "피싱 성공 근거" : "피싱 실패 근거"}
+                    시뮬레이션 판정 요약
                   </h4>
                   <p
                     className="text-sm leading-relaxed whitespace-pre-wrap"
                     style={{ color: THEME.sub }}
                   >
-                    {caseEvidence || "근거 정보가 없습니다."}
+                    {finalAnswerText || caseEvidence || "근거 정보가 없습니다."}
                   </p>
                 </div>
               </div>

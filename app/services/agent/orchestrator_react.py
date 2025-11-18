@@ -74,7 +74,7 @@ def _parsing_error_handler(error: Exception) -> str:
         "Action Input: (JSON 한 줄)\n"
         "Observation: (도구 출력)\n"
         "...\n"
-        "Final Answer: (마지막에 한 번만)\n"
+        "Final Answer: 최종 요약(최종 case_id, 총 라운드 수, 각 라운드 판정 요약/피싱 여부 포함)\n"
     )
 
 def _ensure_stream(stream_id: str) -> _StreamState:
@@ -877,7 +877,7 @@ REACT_SYS = (
     "  Action Input: (JSON 한 줄)\n"
     "  Observation: 도구 출력\n"
     "  ... 필요시 반복 ...\n"
-    "  Final Answer: 최종 요약\n"
+    "  Final Answer: 최종 요약(최종 case_id, 총 라운드 수, 각 라운드 판정 요약 포함)\n"
     "\n"
     "▼ 도구/Final Answer 규칙\n"
     "  • 각 입력 미션에서 요구된 필수 도구들을 **모두 호출하여 Observation을 받은 후에만** Final Answer를 출력할 수 있다.\n"
@@ -889,6 +889,20 @@ REACT_SYS = (
     "  3. □ admin.make_prevention을 호출했는가?\n"
     "  4. □ admin.save_prevention을 호출했는가?\n"
     "  5. □ 위 4개 항목이 모두 체크되었을 때만 Final Answer 작성\n"
+    "\n"
+    "▼ Final Answer 구성 규칙\n"
+    "  Final Answer에는 반드시 아래 정보를 포함한다.\n"
+    "  - CASE_ID: 이 케이스에서 사용된 최종 case_id\n"
+    "  - 총 라운드 수: 실제로 수행된 라운드 수\n"
+    "  - 라운드별 판정 요약: 각 라운드별 보이스피싱 여부(phishing), risk.level, 근거 한 줄\n"
+    "  예시 포맷:\n"
+    "  Final Answer: \n"
+    "  CASE_ID: <case_id>\n"
+    "  총 라운드 수: <rounds_done>\n"
+    "  라운드별 판정:\n"
+    "    - Round 1: phishing=<true|false>, risk.level=\"<level>\", 요약=<한 줄>\n"
+    "    - Round 2: ...\n"
+    "  최종 예방 요약: admin.make_prevention Observation을 기반으로 한 한 단락 요약\n"
     "\n"
     "▼ 안전/정책 관련 규칙\n"
     "  • 이 시뮬레이션은 보이스피싱 **예방·훈련 목적의 교육용** 시뮬레이션이다.\n"
@@ -1401,6 +1415,7 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
                 "tavily_used": False,
                 "personalized_prevention": prevention_obj,
                 "finished_reason": finished_reason,
+                "round_judgements": judgements_history,  # ★ 라운드별 판정 요약
             }
 
             with contextlib.suppress(Exception):
