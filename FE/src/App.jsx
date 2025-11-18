@@ -354,6 +354,9 @@ const addChat = (sender, content, timestamp = null, senderLabel = null, side = n
     judgements,
     guidances,
     preventions,
+    ttsRuns,
+    ttsCaseId,
+    ttsCache,
   } = useSimStream(setMessages, {
     addSystem,
     addChat,
@@ -501,6 +504,9 @@ const addChat = (sender, content, timestamp = null, senderLabel = null, side = n
     judgements,
     guidances,
     preventions,
+    ttsRunsFromStream: ttsRuns,
+    ttsCaseIdFromStream: ttsCaseId,
+    ttsCacheFromStream: ttsCache,
 
     victimImageUrl: selectedCharacter
       ? getVictimImage(selectedCharacter.photo_path)

@@ -23,6 +23,12 @@ export function useSimStream(
   const [guidances, setGuidances] = useState([]);
   const [preventions, setPreventions] = useState([]);
 
+  // 🔊 TTS용 원본 대화 로그 캐시 (메모리)
+  const [ttsCache, setTtsCache] = useState({
+    caseId: null,      // 문자열
+    byRun: {},         // { [runNo: number]: { turns: [] } }
+  });
+
   const [running, setRunning] = useState(false);
 
   const iterRef = useRef(null);
@@ -33,7 +39,10 @@ export function useSimStream(
   const seenTurnsRef = useRef(new Set());
 
   const lastRoundRef = useRef(null);
-  lastRoundRef.current = null;
+
+  // 🔊 TTS용: conversation_log 순서 기반 run 번호 / case_id
+  const [ttsRuns, setTtsRuns] = useState([]);
+  const [ttsCaseId, setTtsCaseId] = useState(null);
   
   const stripAnsi = (s = "") => String(s).replace(/\x1B\[[0-9;]*m/g, "");
   const containsFinishedChain = (text = "") => /\bFinished chain\b/i.test(stripAnsi(text));
@@ -82,6 +91,13 @@ export function useSimStream(
       setGuidances([]);
       setPreventions([]);
 
+      // 🔊 TTS 캐시도 초기화
+      setTtsCache({ caseId: null, byRun: {} });
+
+      // 🔊 TTS용 초기화
+      setTtsRuns([]);
+      setTtsCaseId(null);
+
       caseIdRef.current = null;
       seenTurnsRef.current = new Set();
       totalRoundsRef.current = payload?.round_limit ?? 5;
@@ -129,13 +145,54 @@ export function useSimStream(
             const logData = typeof evt === "object" ? evt : event?.content;
             const turns = logData?.turns || logData?.log?.turns || [];
 
-            // ⭐ 현재 라운드 번호 감지
-            const roundNo =
+            // ⭐ 현재 라운드 번호 감지 (없으면 1로)
+            const roundNoRaw =
               logData?.round_no ||
               logData?.run_no ||
               logData?.meta?.round_no ||
               logData?.meta?.run_no ||
+              logData?.stats?.round ||
+              logData?.stats?.run ||
+              1;
+            const roundNo = Number(roundNoRaw) || 1;
+
+            // 🔊 TTS용 case_id 감지
+            const caseId =
+              logData?.case_id ||
+              logData?.caseId ||
+              logData?.meta?.case_id ||
+              logData?.log?.case_id ||
+              caseIdRef.current ||
               null;
+
+            if (caseId && !caseIdRef.current) {
+              caseIdRef.current = caseId;
+            }
+            if (caseId) {
+              // 한 번만 세팅 (이미 있으면 유지)
+              setTtsCaseId((prev) => prev ?? caseId);
+            }
+
+            // 🔊 TTS용 run 번호 목록 갱신
+            setTtsRuns((prev) => {
+              if (prev.includes(roundNo)) return prev;
+              return [...prev, roundNo].sort((a, b) => a - b);
+            });
+
+            // 🔊 TTS용 원본 turns 캐시에 run별로 누적
+            if (caseId && Array.isArray(turns) && turns.length > 0) {
+              setTtsCache((prev) => {
+                const byRun = { ...(prev.byRun || {}) };
+                const prevTurns = byRun[roundNo]?.turns || [];
+                byRun[roundNo] = {
+                  turns: [...prevTurns, ...turns],
+                };
+                return {
+                  caseId: prev.caseId || caseId,
+                  byRun,
+                };
+              });
+            }
 
             // ⭐ 라운드가 바뀌었으면 라운드 박스 메시지 시스템으로 삽입
             if (roundNo !== null && lastRoundRef.current !== roundNo) {
@@ -381,5 +438,9 @@ export function useSimStream(
     judgements,
     guidances,
     preventions,
+    // 🔊 TTS용 정보
+    ttsRuns,
+    ttsCaseId,
+    ttsCache,
   };
 }

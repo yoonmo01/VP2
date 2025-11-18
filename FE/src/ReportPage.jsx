@@ -70,6 +70,49 @@ const ReportPage = ({
     const trimmed = cleaned.trim();
     return trimmed.length > 0 ? trimmed : null;
   }, [streamLogs]);
+  // 🎨 Final Answer 파싱: case_id, 총 라운드, 라운드별 판정, 최종 예방 요약
+  const parsedFinalAnswer = useMemo(() => {
+    if (!finalAnswerText) return null;
+
+    const result = {
+      caseId: null,
+      totalRounds: 0,
+      rounds: [],
+      summary: null
+    };
+
+    // CASE_ID 추출
+    const caseIdMatch = finalAnswerText.match(/CASE_ID:\s*([a-f0-9\-]+)/i);
+    if (caseIdMatch) result.caseId = caseIdMatch[1];
+
+    // 총 라운드 수 추출
+    const totalRoundsMatch = finalAnswerText.match(/총 라운드 수:\s*(\d+)/);
+    if (totalRoundsMatch) result.totalRounds = parseInt(totalRoundsMatch[1]);
+
+    // 라운드별 판정 추출
+    const roundRegex = /Round (\d+):\s*phishing=(true|false),\s*risk\.level="([^"]+)",\s*요약=([^\.]+\.)(?=\s*-\s*Round|\s*최종 예방 요약|$)/gs;
+    let roundMatch;
+    while ((roundMatch = roundRegex.exec(finalAnswerText)) !== null) {
+      result.rounds.push({
+        round: parseInt(roundMatch[1]),
+        phishing: roundMatch[2] === 'true',
+        riskLevel: roundMatch[3],
+        summary: roundMatch[4].trim().replace(/\s*-\s*$/, '')
+      });
+    }
+
+    // 최종 예방 요약 추출
+    const summaryMatch = finalAnswerText.match(/최종 예방 요약:\s*(.+?)(?=\s*>\s*Finished chain\.|$)/s);
+    if (summaryMatch) {
+      result.summary = summaryMatch[1]
+        .trim()
+        .replace(/\s*>\s*Finished chain\.\s*$/g, '')
+        .trim();
+    }
+
+    return result;
+  }, [finalAnswerText]);
+
 
 
   // 🧠 1) judgement SSE 정규화
@@ -423,26 +466,161 @@ const ReportPage = ({
                     <AlertTriangle className="mr-3" size={26} />
                     피싱 판정 결과
                   </h2>
+                  {parsedFinalAnswer?.caseId && (
+                    <div
+                      className="px-3 py-1 rounded text-xs font-mono"
+                      style={{
+                        backgroundColor: THEME.panelDark,
+                        border: `1px solid ${THEME.border}`,
+                        color: THEME.sub,
+                      }}
+                    >
+                      ID: {parsedFinalAnswer.caseId}
+                    </div>
+                  )}
+                </div>
+                {parsedFinalAnswer ? (
+                  <div className="space-y-6">
+                    {/* 총 라운드 수 */}
+                    {parsedFinalAnswer.totalRounds > 0 && (
+                      <div
+                        className="p-4 rounded-lg"
+                        style={{
+                          backgroundColor: THEME.bg,
+                          border: `1px solid ${THEME.border}`,
+                        }}
+                      >
+                        <div className="flex items-center gap-2">
+                          <span
+                            className="font-semibold text-base"
+                            style={{ color: THEME.text }}
+                          >
+                            총 라운드 수:
+                          </span>
+                          <span
+                            className="text-2xl font-bold"
+                            style={{ color: THEME.blurple }}
+                          >
+                            {parsedFinalAnswer.totalRounds}
+                          </span>
+                        </div>
+                      </div>
+                    )}
 
-                </div>
-                <div
-                  className="mt-2 p-4 rounded"
-                  style={{
-                    backgroundColor: THEME.bg,
-                    border: `1px solid ${THEME.border}`,
-                    color: THEME.text,
-                  }}
-                >
-                  <h4 className="font-semibold mb-2">
-                    시뮬레이션 판정 요약
-                  </h4>
-                  <p
-                    className="text-sm leading-relaxed whitespace-pre-wrap"
-                    style={{ color: THEME.sub }}
+                    {/* 라운드별 판정 */}
+                    {parsedFinalAnswer.rounds.length > 0 && (
+                      <div>
+                        <h4
+                          className="font-semibold text-lg mb-3"
+                          style={{ color: THEME.text }}
+                        >
+                          라운드별 판정
+                        </h4>
+                        <div className="space-y-3">
+                          {parsedFinalAnswer.rounds.map((round) => {
+                            const riskColor =
+                              round.riskLevel.toLowerCase() === "high"
+                                ? THEME.danger
+                                : round.riskLevel.toLowerCase() === "medium"
+                                  ? THEME.warn
+                                  : THEME.success;
+
+                            return (
+                              <div
+                                key={round.round}
+                                className="p-4 rounded-lg"
+                                style={{
+                                  backgroundColor: THEME.bg,
+                                  border: `1px solid ${THEME.border}`,
+                                }}
+                              >
+                                <div className="flex items-center justify-between mb-2">
+                                  <span
+                                    className="font-semibold text-base"
+                                    style={{ color: THEME.text }}
+                                  >
+                                    Round {round.round}
+                                  </span>
+                                  <div className="flex items-center gap-2">
+                                    <span
+                                      className="px-3 py-1 rounded text-xs font-semibold"
+                                      style={{
+                                        backgroundColor: round.phishing
+                                          ? THEME.danger
+                                          : THEME.success,
+                                        color: THEME.white,
+                                      }}
+                                    >
+                                      {round.phishing ? "피싱" : "정상"}
+                                    </span>
+                                    <span
+                                      className="px-3 py-1 rounded text-xs font-semibold"
+                                      style={{
+                                        backgroundColor: riskColor,
+                                        color: THEME.white,
+                                      }}
+                                    >
+                                      {round.riskLevel}
+                                    </span>
+                                  </div>
+                                </div>
+                                <p
+                                  className="text-sm leading-relaxed"
+                                  style={{ color: THEME.sub }}
+                                >
+                                  {round.summary}
+                                </p>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* 최종 예방 요약 */}
+                    {parsedFinalAnswer.summary && (
+                      <div
+                        className="p-4 rounded-lg"
+                        style={{
+                          backgroundColor: THEME.bg,
+                          border: `1px solid ${THEME.border}`,
+                        }}
+                      >
+                        <h4
+                          className="font-semibold text-base mb-3"
+                          style={{ color: THEME.text }}
+                        >
+                          최종 예방 요약
+                        </h4>
+                        <p
+                          className="text-sm leading-relaxed whitespace-pre-wrap"
+                          style={{ color: THEME.sub }}
+                        >
+                          {parsedFinalAnswer.summary}
+                        </p>
+                      </div>
+                    )}
+                  </div>
+                ) : (
+                  <div
+                    className="mt-2 p-4 rounded"
+                    style={{
+                      backgroundColor: THEME.bg,
+                      border: `1px solid ${THEME.border}`,
+                      color: THEME.text,
+                    }}
                   >
-                    {finalAnswerText || caseEvidence || "근거 정보가 없습니다."}
-                  </p>
-                </div>
+                    <h4 className="font-semibold mb-2">
+                      시뮬레이션 판정 요약
+                    </h4>
+                    <p
+                      className="text-sm leading-relaxed whitespace-pre-wrap"
+                      style={{ color: THEME.sub }}
+                    >
+                      {finalAnswerText || caseEvidence || "근거 정보가 없습니다."}
+                    </p>
+                  </div>
+                )}
               </div>
 
               {/* 개인화 예방법 */}

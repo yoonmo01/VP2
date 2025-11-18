@@ -16,7 +16,7 @@ import SpinnerMessage from "./SpinnerMessage";
 import CustomCharacterCreate from "./CustomCharacterCreate";
 import TTSModal from "./components/TTSModal";
 import CustomScenarioButton from "./CustomScenarioButton";
-// import CustomScenarioModal from "./CustomScenarioModal";
+import CustomScenarioModal from "./CustomScenarioModal";
 import TerminalLog from "./components/TerminalLog";
 import InvestigationBoard from "./InvestigationBoard";
 import { THEME as BASE_THEME } from "./constants/colors";
@@ -85,6 +85,9 @@ const SimulatorPage = ({
   judgements,
   guidances,
   preventions,
+  ttsRunsFromStream,
+  ttsCaseIdFromStream,
+  ttsCacheFromStream,
 }) => {
   // logs / running 은 props로 받은 걸 로컬 변수로 정리
   const logs = streamLogs ?? [];
@@ -263,6 +266,29 @@ const SimulatorPage = ({
     danger: "#ff4d4f",
     warn: "#facc15",
   };
+
+  const ttsCaseId =
+    ttsCaseIdFromStream ||
+    (Array.isArray(preventions) && preventions[0]?.case_id) ||
+    (Array.isArray(judgements) && judgements[0]?.case_id) ||
+    sessionResult?.case_id ||
+    sessionResult?.caseId ||
+    null;
+
+  // 🔊 TTS용 run 번호 목록
+  const ttsRuns = useMemo(() => {
+    // 1순위: useSimStream에서 conversation_log 순서대로 만들어준 값
+    if (Array.isArray(ttsRunsFromStream) && ttsRunsFromStream.length > 0) {
+      return [...new Set(ttsRunsFromStream)].sort((a, b) => a - b);
+    }
+
+    // 2순위: 기존처럼 judgement에 run_no가 있을 경우 fallback
+    if (!Array.isArray(judgements)) return [];
+    const nums = judgements
+      .map((j) => j.run_no ?? j.runNo ?? j.data?.run_no)
+      .filter((v) => typeof v === "number" && Number.isFinite(v));
+    return [...new Set(nums)].sort((a, b) => a - b);
+  }, [ttsRunsFromStream, judgements]);
 
   // 진행률 계산 (단순 10턴 기준)
   useEffect(() => {
@@ -799,7 +825,7 @@ const SimulatorPage = ({
                             className="p-4 text-sm opacity-70"
                             style={{ color: THEME.sub }}
                           >
-                            분석 데이터를 불러오는 중입니다...
+                            분석 데이터를 생성하는 중입니다...
                           </div>
                         )}
                       </div>
@@ -852,11 +878,24 @@ const SimulatorPage = ({
         </div>
       </div>
 
-      {/* 모달 */}
+      {/* 🔊 TTS 모달 */}
       <TTSModal
         isOpen={openTTS}
         onClose={() => setOpenTTS(false)}
         COLORS={THEME}
+        // 🔥 백엔드 TTS 생성/조회에 사용할 case_id
+        caseId={ttsCaseId}
+        // 🔥 버튼 생성에 사용할 run_no 목록 (예: [1,2,3])
+        availableRuns={ttsRuns}
+        ttsCache={ttsCacheFromStream}
+      />
+      {/* 🔥 커스텀 시나리오 모달 */}
+      <CustomScenarioModal
+        open={showCustomModal}                    // ✅ prop 이름: open
+        onClose={() => setShowCustomModal(false)}
+        onSave={handleSaveCustomScenario}
+        COLORS={THEME}
+        selectedTag={selectedTag}                // ✅ CustomScenarioModal이 요구하는 prop
       />
     </div>
   );

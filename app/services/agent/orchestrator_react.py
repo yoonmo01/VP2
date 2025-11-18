@@ -21,6 +21,7 @@ from app.services.agent.tools_mcp import make_mcp_tools
 from app.services.agent.tools_tavily import make_tavily_tools
 from app.services.agent.guideline_repo_db import GuidelineRepoDB
 from app.core.logging import get_logger
+from app.services.tts_service import start_tts_for_run_background
 
 from app.schemas.simulation_request import SimulationStartRequest
 from app.services.prompt_integrator_db import build_prompt_package_from_payload
@@ -651,6 +652,11 @@ def _wrap_sim_compose_prompts(original_tool):
             }
 
         # 2) {"data": {...}} / {...} 둘 다 지원
+        logger.info(f"[PromptCache] parsed keys: {list(parsed.keys())}")
+        logger.info(f"[PromptCache] 'data' in parsed: {'data' in parsed}")
+        if 'data' in parsed:
+            logger.info(f"[PromptCache] parsed['data'] type: {type(parsed.get('data'))}")
+            logger.info(f"[PromptCache] parsed['data'] keys: {list(parsed['data'].keys()) if isinstance(parsed.get('data'), dict) else 'N/A'}")
         if "data" in parsed and isinstance(parsed["data"], dict):
             inner = parsed["data"]
             if "round_no" in parsed and "round_no" not in inner:
@@ -658,10 +664,34 @@ def _wrap_sim_compose_prompts(original_tool):
         else:
             inner = parsed
 
+    # ★ 방어: inner가 비었으면 parsed 전체를 사용
+        if not inner:
+            logger.warning("[PromptCache] inner가 비어있음 → parsed 전체 사용")
+            inner = parsed
+            # ★★ parsed도 비었으면 에러 반환
+            if not inner:
+                return {
+                    "ok": False,
+                    "error": "empty_input",
+                    "message": "sim.compose_prompts에 빈 데이터가 전달되었습니다. scenario/victim_profile이 필요합니다.",
+                    "parsed_keys": list(parsed.keys()),
+                }
+
+        # ★★★ 추가 진단: inner에 scenario/victim_profile이 있는지 미리 확인
+        logger.info(f"[PromptCache] inner keys after logic: {list(inner.keys())}")
+        logger.info(f"[PromptCache] scenario in inner (before invoke): {'scenario' in inner}")
+        logger.info(f"[PromptCache] victim_profile in inner (before invoke): {'victim_profile' in inner}")
         payload = {"data": inner}
 
         # 3) 원본 도구 호출
-        result = original_tool.invoke(payload)
+        try:
+            result = original_tool.invoke(payload)
+        except Exception as e:
+            logger.error(f"[sim.compose_prompts] 원본 도구 호출 실패: {e}")
+            return {
+                "ok": False,
+                "error": f"프롬프트 생성 실패: {str(e)}"
+            }
 
         # 4) 결과 파싱
         if isinstance(result, str):
@@ -678,14 +708,31 @@ def _wrap_sim_compose_prompts(original_tool):
 
         if not attacker_prompt or not victim_prompt:
             return {"ok": False, "error": "프롬프트가 비어있습니다"}
-
-        # ★ 여기서 fetch_entities에서 넘어온 scenario/victim_profile을 그대로 저장
+        
+        # ★★★ scenario/victim_profile 추출 (원본 도구 호출 후)
+        # 1차: inner에서 추출
         scenario = inner.get("scenario")
         victim_profile = inner.get("victim_profile")
-
         round_no = inner.get("round_no", 1)
+        
+        # 2차: result에서 fallback (원본 도구가 반환했을 수도 있음)
+        if scenario is None:
+            scenario = result.get("scenario")
+        if victim_profile is None:
+            victim_profile = result.get("victim_profile")
+        # 3차: parsed에서 fallback (최후의 수단)
+        if scenario is None:
+            scenario = parsed.get("scenario")
+        if victim_profile is None:
+            victim_profile = parsed.get("victim_profile")
+
+        # 디버깅 로그
+        logger.info(f"[PromptCache] inner keys: {list(inner.keys())}")
+        logger.info(f"[PromptCache] result keys: {list(result.keys())}")
+
         prompt_id = f"prompts_round_{round_no}_{id(result)}"
 
+        # ★★★ 캐시에 저장 (원본 도구 호출 전에 추출한 데이터 사용)
         _PROMPT_CACHE[prompt_id] = {
             "attacker_prompt": attacker_prompt,
             "victim_prompt": victim_prompt,
@@ -694,6 +741,12 @@ def _wrap_sim_compose_prompts(original_tool):
         }
 
         logger.info(f"[PromptCache] 저장: {prompt_id} (round={round_no})")
+        logger.info(f"[PromptCache] scenario 존재: {scenario is not None}, victim_profile 존재: {victim_profile is not None}")
+
+        # 경고: None인 경우
+        if scenario is None or victim_profile is None:
+            logger.warning(f"[PromptCache] 경고: scenario={scenario is not None}, victim_profile={victim_profile is not None}")
+            logger.warning(f"[PromptCache] 이 경우 mcp.simulator_run에서 에러가 발생할 수 있습니다")
 
         return {
             "ok": True,
@@ -1294,7 +1347,20 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
                         turns = sim_dict.get("turns") or []
                         if isinstance(turns, list):
                             turns_all.extend(turns)
-                            
+                            # ── TTS 비동기 생성 트리거 (run 단위) ───────────────────────────
+                            #  - DB에 의존하지 않고, 해당 run의 전체 대화로그를 그대로 전달
+                            #  - 실제 비동기 처리/캐싱 로직은 app.services.tts_service 쪽에서 구현
+                            try:
+                                sim_case_id = sim_dict.get("case_id")
+                                if sim_case_id and turns:
+                                    start_tts_for_run_background(
+                                        case_id=str(sim_case_id),
+                                        run_no=sim_run_idx,
+                                        turns=turns,
+                                    )
+                            except Exception as e:
+                                logger.warning(f"[TTS] run {sim_run_idx} 백그라운드 생성 실패: {e}")
+
                             # DB 저장 (라운드별)
                             try:
                                 round_row = (
