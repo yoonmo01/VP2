@@ -78,28 +78,37 @@ class CaseDialogueRequest(BaseModel):
 # 음성 매핑
 # ============================================
 VOICE_BY_SPEAKER = {
-    "offender": {"languageCode": "ko-KR", "voiceName": "ko-KR-Standard-C"},
-    "victim":   {"languageCode": "ko-KR", "voiceName": "ko-KR-Standard-A"},
+    # 피싱범: 기본은 남자 프리미엄 (성별 정보 없을 때)
+    "offender": {"languageCode": "ko-KR", "voiceName": "ko-KR-Chirp3-HD-Algenib"},
+    # 피해자: age_group / gender 없을 때 fallback용 프리미엄 여 보이스
+    "victim":   {"languageCode": "ko-KR", "voiceName": "ko-KR-Chirp3-HD-Aoede"},
 }
 
+# 피싱범: 성별 2종 전용 보이스
+OFFENDER_VOICE_BY_GENDER = {
+    "male": "ko-KR-Chirp3-HD-Algenib",
+    "female": "ko-KR-Chirp3-HD-Erinome",
+}
+
+
 VOICE_BY_AGE_GENDER = {
-    ("20s", "female"): "ko-KR-Standard-A",
-    ("30s", "female"): "ko-KR-Standard-A",
-    ("20s", "male")  : "ko-KR-Standard-C",
-    ("30s", "male")  : "ko-KR-Standard-C",
-    ("40s", "female"): "ko-KR-Standard-B",
-    ("50s", "female"): "ko-KR-Standard-B",
-    ("60s", "female"): "ko-KR-Standard-B",
-    ("40s", "male")  : "ko-KR-Standard-D",
-    ("50s", "male")  : "ko-KR-Standard-D",
-    ("60s", "male")  : "ko-KR-Standard-D",
+    ("20s", "female"): "ko-KR-Chirp3-HD-Aoede",
+    ("30s", "female"): "ko-KR-Chirp3-HD-Achernar",
+    ("40s", "female"): "ko-KR-Chirp3-HD-Gacrux",
+    ("50s", "female"): "ko-KR-Chirp3-HD-Erinome",
+    ("60s", "female"): "ko-KR-Chirp3-HD-Pulcherrima",
+    ("70s+", "female"): "ko-KR-Chirp3-HD-Vindemiatrix",
+    ("20s", "male"): "ko-KR-Chirp3-HD-Achird",
+    ("30s", "male"): "ko-KR-Chirp3-HD-Algenib",
+    ("40s", "male"): "ko-KR-Chirp3-HD-Umbriel",
+    ("50s", "male"): "ko-KR-Chirp3-HD-Rasalgethi",
+    ("60s", "male"): "ko-KR-Chirp3-HD-Alnilam",
+    ("70s+", "male"): "ko-KR-Chirp3-HD-Sadachbia",
 }
 
 OFFENDER_ALTERNATES = [
-    "ko-KR-Standard-A",
-    "ko-KR-Standard-B",
-    "ko-KR-Standard-C",
-    "ko-KR-Standard-D",
+    "ko-KR-Chirp3-HD-Umbriel",
+    "ko-KR-Chirp3-HD-Rasalgethi",
 ]
 
 # ============================================
@@ -220,22 +229,27 @@ def choose_voice_name(
     taken_voices: Optional[Set[str]] = None
 ) -> str:
     """화자/연령/성별 기반 음성 선택"""
-    # 1. 연령+성별 우선
+    # 0. 피싱범: 성별만 보고 2개 중 하나 선택
+    if speaker == "offender" and gender:
+        base_candidate = OFFENDER_VOICE_BY_GENDER.get(gender)
+        if base_candidate:
+            # 피해자 음성과 겹치면 대체 후보 사용
+            if taken_voices and base_candidate in taken_voices:
+                for alt in OFFENDER_ALTERNATES:
+                    if alt not in taken_voices:
+                        return alt
+            return base_candidate
+
+    # 1. 피해자: 연령성별 프리미엄 매핑
     if age_group and gender:
         candidate = VOICE_BY_AGE_GENDER.get((age_group, gender))
         if candidate:
             return candidate
-    
-    # 2. speaker 기반
+
+    # 2. 기본 fallback: speaker 기반
     base = VOICE_BY_SPEAKER.get(speaker, VOICE_BY_SPEAKER["victim"])
     candidate = base["voiceName"]
-    
-    # 3. offender 충돌 방지
-    if speaker == "offender" and taken_voices and candidate in taken_voices:
-        for alt in OFFENDER_ALTERNATES:
-            if alt not in taken_voices:
-                return alt
-    
+
     return candidate
 
 # ============================================
@@ -287,8 +301,7 @@ def synthesize_case_dialogue(
         turns = round_row.turns or []
         source = "db"
         
-        # 캐시에 저장 (다음 요청용)
-        cache_run_dialog(case_id, run_no, turns)
+
     
     if not turns:
         raise HTTPException(

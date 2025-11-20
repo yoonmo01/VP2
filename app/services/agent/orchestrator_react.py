@@ -71,6 +71,31 @@ def _make_run_key(payload: Dict[str, Any]) -> str:
         return str(key)
 
 def _parsing_error_handler(error: Exception) -> str:
+    error_msg = str(error)
+    
+    # Final Answer 관련 에러 감지
+    if "Final Answer" in error_msg or "final answer" in error_msg.lower():
+        return (
+            "⚠️ Final Answer 작성 시도 감지 - 필수 도구 체크 필요!\n"
+            "\n"
+            "Final Answer를 작성하기 전에 다음을 확인하세요:\n"
+            "\n"
+            "1. admin.make_prevention을 호출했는가?\n"
+            "   Thought: 예방책을 생성해야 함\n"
+            "   Action: admin.make_prevention\n"
+            "   Action Input: {\"data\": {\"case_id\": \"...\", \"rounds\": N, ...}}\n"
+            "   Observation: (반드시 확인)\n"
+            "\n"
+            "2. admin.save_prevention을 호출했는가?\n"
+            "   Thought: 예방책을 저장해야 함\n"
+            "   Action: admin.save_prevention\n"
+            "   Action Input: {\"data\": {\"case_id\": \"...\", ...}}\n"
+            "   Observation: (반드시 확인)\n"
+            "\n"
+            "위 2개 도구를 호출하지 않았다면, 지금 즉시 호출하세요.\n"
+            "도구를 호출하지 않고 텍스트를 직접 작성하는 것은 금지됩니다.\n"
+        )
+    
     return (
         "Invalid Format: 이전 출력은 무시하라.\n"
         "다음 형식을 정확히 지켜 다시 출력하라.\n\n"
@@ -560,67 +585,55 @@ def _smart_print(*args, **kwargs):
             return
 
         tag = None
-        
+
         # ★★★ conversation_log 감지 (MCP 대화 결과)
         if ("case_id" in data) and ("turns" in data) and ("stats" in data):
             tag = "conversation_log"
-            
-            # ✅ 즉시 TTS 캐시 저장
+
+            # ✅ 여기서 TTS 캐시 저장까지 같이 처리
             try:
-                case_id = data.get("case_id")
-                run_no = data.get("run_no", 1)  # run_no가 없으면 1로 가정
+                case_id = str(data.get("case_id"))
+                run_no = int(data.get("run_no", 1))
                 raw_turns = data.get("turns", [])
 
-                # ★★★ 메타 정보 추출 (피해자 성별)
-                meta = data.get("meta", {})
-                victim_profile = meta.get("victim_profile", {})
-                victim_meta = victim_profile.get("meta", {})
-                victim_gender = victim_meta.get("gender", "여")  # 기본값: 여성
-                
-                # victim dialogue 정리
                 cleaned_turns = []
                 for turn in raw_turns:
                     role = turn.get("role", "")
                     text = turn.get("text", "")
-                    
-                    # victim의 JSON 응답 처리
-                    if role == "victim" and text.strip().startswith("{"):
-                        try:
-                            victim_json = json.loads(text)
-                            text = victim_json.get("dialogue", text)
-                        except:
-                            pass
-                    
-                    cleaned_turns.append({
-                        "role": role,
-                        "text": text
-                    })
-                
+
+                    # 피해자 턴이 JSON이면 dialogue만 뽑기
+                    if role == "victim":
+                        s = (text or "").strip()
+                        if s.startswith("{"):
+                            try:
+                                v_json = json.loads(s)
+                                text = v_json.get("dialogue", text)
+                            except Exception:
+                                # 파싱 실패하면 원문 그대로 둠
+                                pass
+
+                    cleaned_turns.append(
+                        {
+                            "role": role,
+                            "text": text,
+                        }
+                    )
+
                 if case_id and cleaned_turns:
+                    # TTS 캐시 저장
                     cache_run_dialog(
-                        case_id=str(case_id),
+                        case_id=case_id,
                         run_no=run_no,
                         turns=cleaned_turns,
                     )
                     logger.info(
-                        "[TTS_CACHE] ★ 즉시 캐시: case_id=%s run_no=%s turns=%s gender=%s",
+                        "[TTS_CACHE] cached from conversation_log: case_id=%s run_no=%s turns=%s",
                         case_id,
                         run_no,
                         len(cleaned_turns),
-                        victim_gender,
-                    )
-                    # ★★★ SSE로 conversation_round 전송 시 gender 포함
-                    _emit_to_stream(
-                        "conversation_round",
-                        {
-                            "case_id": str(case_id),
-                            "run_no": run_no,
-                            "turns": _truncate(cleaned_turns, 2000),
-                            "victim_gender": victim_gender,  # ← 추가!
-                        },
                     )
             except Exception as e:
-                logger.error(f"[TTS_CACHE] _smart_print 캐시 저장 실패: {e}")
+                logger.error("[TTS_CACHE] _smart_print 캐시 저장 실패: %s", e)
         
         elif ("persisted" in data) and ("phishing" in data) and ("risk" in data):
             tag = "judgement"
@@ -1031,6 +1044,7 @@ REACT_SYS = (
     "▼ 도구 사용 원칙\n"
     "• 주어진 \"도구 이름 목록\"에 없는 도구는 절대 호출하지 않는다.\n"
     "• 한 단계가 실패하면, 같은 잘못된 입력을 반복하지 말고 사유를 점검한 뒤 올바른 입력으로 재호출한다.\n"
+    "• 도구를 호출하지 않고 직접 결과를 작성하거나 요약하는 것은 금지된다.\n"
     "\n"
     "▼ 출력 포맷 (반드시 준수)\n"
     "  Thought: 현재 판단/계획(간결히)\n"
@@ -1043,19 +1057,30 @@ REACT_SYS = (
     "▼ 도구/Final Answer 규칙\n"
     "  • 각 입력 미션에서 요구된 필수 도구들을 **모두 호출하여 Observation을 받은 후에만** Final Answer를 출력할 수 있다.\n"
     "  • 도구를 한 번도 호출하지 않은 채 Final Answer만 출력하는 응답은 **잘못된 출력**이며, 포맷 오류로 간주된다.\n"
+    "  • 특히 admin.make_prevention과 admin.save_prevention은 **절대 생략 불가**이다.\n"
     "\n"
     "▼ Final Answer 작성 전 필수 체크리스트\n"
-    "  1. □ 모든 필수 도구를 호출했는가?\n"
-    "  2. □ 각 도구의 Observation을 받았는가?\n"
-    "  3. □ admin.make_prevention을 호출했는가?\n"
-    "  4. □ admin.save_prevention을 호출했는가?\n"
-    "  5. □ 위 4개 항목이 모두 체크되었을 때만 Final Answer 작성\n"
+    "  ⚠️ Final Answer 작성 전 반드시 확인:\n"
+    "  1. ✅ admin.make_prevention을 호출하여 Observation을 받았는가?\n"
+    "  2. ✅ admin.save_prevention을 호출하여 Observation을 받았는가?\n"
+    "  3. ✅ 위 2개 도구의 Observation에 실제 데이터가 포함되어 있는가?\n"
+    "\n"
+    "  ❌ 다음 행동은 절대 금지:\n"
+    "  • 도구를 호출하지 않고 '최종 예방 요약'이라는 텍스트를 직접 작성\n"
+    "  • admin.make_prevention 없이 예방책 내용을 날조\n"
+    "  • 단계 10, 11을 건너뛰고 바로 Final Answer 작성\n"
+    "\n"
+    "  ✅ 올바른 순서:\n"
+    "  → admin.make_prevention 호출 → Observation 확인\n"
+    "  → admin.save_prevention 호출 → Observation 확인\n"
+    "  → Final Answer 작성 (Observation 내용 포함)\n"
     "\n"
     "▼ Final Answer 구성 규칙\n"
     "  Final Answer에는 반드시 아래 정보를 포함한다.\n"
     "  - CASE_ID: 이 케이스에서 사용된 최종 case_id\n"
     "  - 총 라운드 수: 실제로 수행된 라운드 수\n"
     "  - 라운드별 판정 요약: 각 라운드별 보이스피싱 여부(phishing), risk.level, 근거 한 줄\n"
+    "  - 예방책: admin.make_prevention의 Observation 내용 (직접 작성 금지)\n"
     "  예시 포맷:\n"
     "  Final Answer: \n"
     "  CASE_ID: <case_id>\n"
@@ -1178,6 +1203,52 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
 
             offender_id = int(req.offender_id or 0)
             victim_id = int(req.victim_id or 0)
+
+            # ─────────────────────────────────────
+            # 피해자/공격자 성별 정보 정리 (TTS용)
+            # ─────────────────────────────────────
+            def _normalize_gender_str(g: Optional[str]) -> Optional[str]:
+                if not g:
+                    return None
+                s = str(g).strip().lower()
+                if s in ("남", "남자", "male", "m"):
+                    return "male"
+                if s in ("여", "여자", "female", "f"):
+                    return "female"
+                return None
+
+            victim_profile_base = _as_dict(victim_profile)
+            victim_meta = victim_profile_base.get("meta", {}) if isinstance(victim_profile_base, dict) else {}
+
+            # 1순위: 요청 payload에 담긴 victim_gender / offender_gender (FE에서 보내는 값)
+            victim_gender_req = _normalize_gender_str(getattr(req, "victim_gender", None))
+            offender_gender_req = _normalize_gender_str(getattr(req, "offender_gender", None))
+
+            # 2순위: DB victim_profile.meta.gender
+            victim_gender_db = _normalize_gender_str(victim_meta.get("gender"))
+
+            victim_gender = victim_gender_req or victim_gender_db or "female"
+            offender_gender = offender_gender_req or "male"
+
+            # (선택) 나이 → age_group으로 변환 (TTS에서 쓰고 있다면)
+            def _age_to_group(age: Optional[int]) -> Optional[str]:
+                try:
+                    a = int(age)
+                except Exception:
+                    return None
+                if a < 30:
+                    return "20s"
+                if a < 40:
+                    return "30s"
+                if a < 50:
+                    return "40s"
+                if a < 60:
+                    return "50s"
+                if a < 70:
+                    return "60s"
+                return "70s+"
+
+            victim_age_group = _age_to_group(victim_meta.get("age"))
 
             # 라운드 정책
             try:
@@ -1504,10 +1575,20 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
                                 except:
                                     pass
                             
-                            cleaned_turns.append({
+                            cleaned = {
                                 "role": role,
-                                "text": text
-                            })
+                                "text": text,
+                            }
+
+                            # 🔊 TTS용 성별/나이 정보 주입
+                            if role == "victim":
+                                cleaned["gender"] = victim_gender       # "male"/"female"
+                                if victim_age_group:
+                                    cleaned["age_group"] = victim_age_group
+                            elif role == "offender":
+                                cleaned["gender"] = offender_gender     # "male"/"female"
+
+                            cleaned_turns.append(cleaned)
                         turns_all.extend(cleaned_turns)
 
                         # ── SSE: 라운드 단위 대화 전달 (TTS 모달 버튼 생성용) ─────────────
@@ -1612,12 +1693,16 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
                                 case_id=str(sim_case_id),
                                 run_no=sim_run_idx,
                                 turns=cleaned_turns,
+                                victim_age=victim_meta.get("age"),
+                                victim_gender=victim_gender,
                             )
                             logger.info(
-                                "[TTS_CACHE] cached dialog for case_id=%s run_no=%s (turns=%s)",
+                                "[TTS_CACHE] cached dialog for case_id=%s run_no=%s (turns=%s, age=%s, gender=%s)",
                                 sim_case_id,
                                 sim_run_idx,
                                 len(cleaned_turns),
+                                victim_meta.get("age"),
+                                victim_gender,
                             )
                         except Exception as e:
                             logger.warning(
