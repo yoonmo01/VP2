@@ -92,15 +92,41 @@ const SimulatorPage = ({
   offenderGenderFromStream,
   victimIdFromStream,
   offenderIdFromStream,  // ✅ 추가
+  offenderProfileId,
+  setOffenderProfileId,
 }) => {
   // logs / running 은 props로 받은 걸 로컬 변수로 정리
   const logs = streamLogs ?? [];
   const running = !!streamRunning;
   // ★★★ App에서 전달받은 victimGender 사용
-  const victimGender = victimGenderFromStream || "여";
-  const offenderGender = offenderGenderFromStream || "male";
-  const victimId = victimIdFromStream || selectedCharacter?.id || 1;  // ✅ fallback 추가
-  const offenderId = offenderIdFromStream || selectedScenario?.id || 1;  // ✅ 추가
+  // 🧍‍♀️ 피해자 성별/ID
+  //   1순위: 선택한 캐릭터 meta.gender
+  //   2순위: SSE에서 온 victimGender
+  const victimGender =
+    (selectedCharacter?.meta?.gender &&
+      String(selectedCharacter.meta.gender).trim()) ||
+    victimGenderFromStream ||
+    "여";
+
+  //   ID는 DB victim_id (selectedCharacter.id)를 기준으로
+  const victimId =
+    selectedCharacter?.id ||
+    victimIdFromStream ||
+    1;
+
+  // 🕴 피싱범(공격자) 성별/프로필 ID
+  //   offenderProfileId: 1 = 남자, 2 = 여자
+  const computedOffenderGender =
+    offenderProfileId === 2
+      ? "female"
+      : offenderProfileId === 1
+      ? "male"
+      : (offenderGenderFromStream || "male");
+
+  const offenderGender = computedOffenderGender;
+
+  //   TTSModal/아바타에서 쓸 "프로필 id" (1 or 2) – 없으면 1 기본
+  const offenderId = offenderProfileId ?? offenderIdFromStream ?? 1;
 
   /* ----------------------------------------------------------
    🧩 상태
@@ -148,24 +174,48 @@ const SimulatorPage = ({
         return;
       }
 
-      const offenderId = Number(selectedScenario.id);
-      const victimId = Number(selectedCharacter.id);
-      if (!Number.isFinite(offenderId) || !Number.isFinite(victimId)) {
-        console.error("❌ ID 타입이 숫자가 아님:", { offenderId, victimId });
+      // 🎯 백엔드/시나리오용 "공격자(offender) DB ID"
+      const offenderDbId = Number(selectedScenario.id);
+      // 🎯 백엔드/피해자 DB ID
+      const victimDbId = Number(selectedCharacter.id);
+      if (!Number.isFinite(offenderDbId) || !Number.isFinite(victimDbId)) {
+        console.error("❌ ID 타입이 숫자가 아님:", {
+          offenderDbId,
+          victimDbId,
+        });
         return;
       }
+      // 🎲 공격자 프로필 (1=남자, 2=여자) – 처음 시작할 때만 랜덤 고정
+      let profileId = offenderProfileId;
+      if (!profileId) {
+        profileId = Math.random() < 0.5 ? 1 : 2;
+        setOffenderProfileId?.(profileId);
+        console.log("🎲 랜덤 offenderProfileId 선택:", profileId);
+      }
+      
 
       setShowStartButton(false);
 
       // ✅ 여기서는 로컬 useSimStream이 아니라 App의 streamStart 호출
       streamStart?.({
-        offender_id: offenderId,
-        victim_id: victimId,
+        // 백엔드 시나리오/DB용
+        offender_id: offenderDbId,
+        victim_id: victimDbId,
+
+        // (선택) 백엔드에서도 성별/프로필을 쓰고 싶으면 같이 넘겨줄 수 있음
+        offender_profile_id: profileId, // 1 or 2
+        offender_gender: profileId === 1 ? "male" : "female",
       });
     } catch (err) {
       console.error("SimulatorPage 실행 중 오류:", err);
     }
-  }, [streamStart, selectedScenario, selectedCharacter]);
+  }, [
+    streamStart,
+    selectedScenario,
+    selectedCharacter,
+    offenderProfileId,
+    setOffenderProfileId,
+  ]);
 
   // 자동 스크롤
   useEffect(() => {
@@ -750,6 +800,7 @@ const SimulatorPage = ({
                               selectedCharacter={selectedCharacter}
                               victimImageUrl={victimImageUrl}
                               COLORS={THEME}
+                              offenderId={offenderId}
                             />
                           );
                         })}
@@ -901,6 +952,7 @@ const SimulatorPage = ({
         offenderGender={offenderGender} // ← 추가
         victimId={victimId}              // ← 추가
         offenderId={offenderId}  // ✅ 추가
+        victimImageUrl={victimImageUrl}
       />
       {/* 🔥 커스텀 시나리오 모달 */}
       <CustomScenarioModal

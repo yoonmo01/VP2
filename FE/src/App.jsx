@@ -325,8 +325,10 @@ const App = () => {
   const [dataError, setDataError] = useState(null);
   const [currentCaseId, setCurrentCaseId] = useState(null);
   const [offenderGender, setOffenderGender] = useState(null);
-  const [offenderId, setOffenderId] = useState(null);  // ✅ 추가
-  const [victimId, setVictimId] = useState(null);      // ✅ 추가
+  const [offenderId, setOffenderId] = useState(null);      // (기존) SSE에서 오는 offender_id
+  const [victimId, setVictimId] = useState(null);          // (기존) SSE에서 오는 victim_id
+
+  const [offenderProfileId, setOffenderProfileId] = useState(null);
 
   const addSystem = (content) =>
     setMessages((prev) => [
@@ -519,6 +521,8 @@ const addChat = (sender, content, timestamp = null, senderLabel = null, side = n
     offenderGenderFromStream: offenderGender, // ★ 추가
     victimIdFromStream: victimId,               // ✅ state 사용
     offenderIdFromStream: offenderId,           // ✅ 추가
+    offenderProfileId,
+    setOffenderProfileId,
 
     victimImageUrl: selectedCharacter
       ? getVictimImage(selectedCharacter.photo_path)

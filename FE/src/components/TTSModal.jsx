@@ -22,7 +22,13 @@ const toUrl = (b64, mime) => {
 };
 
 // ★★★ 프로필 설정 훅
-function useProfileConfig(victimGender, offenderGender, victimId, offenderId) {  // ✅ 파라미터 추가
+function useProfileConfig(
+  victimGender,
+  offenderGender,
+  victimId,
+  offenderId,
+  victimImageUrl,   // 🎯 추가
+) {
   const profiles = useMemo(() => {
     // ★★★ victim_id → 이미지 매핑
     const victimImageMap = {
@@ -30,7 +36,9 @@ function useProfileConfig(victimGender, offenderGender, victimId, offenderId) { 
       2: victim2,
       // 필요시 추가
     };
-    const victimImage = victimImageMap[victimId] || victim1;
+    // 1순위: 실제 선택된 캐릭터 이미지(victimImageUrl)
+    // 2순위: 기존 victimId 기반 더미 이미지
+    const victimImage = victimImageUrl || victimImageMap[victimId] || victim1;
 
     // ★★★ offender_id → 이미지 매핑
     const offenderImageMap = {
@@ -41,7 +49,10 @@ function useProfileConfig(victimGender, offenderGender, victimId, offenderId) { 
     
     // ★★★ 성별 기반 음성 코드
     const isMaleVictim = victimGender === "남" || victimGender === "male";
-    const isMaleOffender = offenderGender === "male";
+    const isMaleOffender =
+      offenderGender === "male" ||
+      offenderGender === "남" ||
+      offenderGender === "남자";
 
     return {
       victim: {
@@ -53,7 +64,7 @@ function useProfileConfig(victimGender, offenderGender, victimId, offenderId) { 
         voice: isMaleOffender ? "ko-KR-Neural2-D" : "ko-KR-Neural2-B",
       },
     };
-  }, [victimGender, offenderGender, victimId, offenderId]);
+  }, [victimGender, offenderGender, victimId, offenderId, victimImageUrl]);
 
   return profiles;
 }
@@ -68,9 +79,16 @@ export default function TTSModal({
   offenderGender = "male",
   victimId = 1,
   offenderId = 1,
+  victimImageUrl,
 }) {
   const theme = COLORS ?? DEFAULT_COLORS;
-  const profiles = useProfileConfig(victimGender, offenderGender, victimId, offenderId);
+  const profiles = useProfileConfig(
+    victimGender,
+    offenderGender,
+    victimId,
+    offenderId,
+    victimImageUrl,
+  );
 
   const [loading, setLoading] = useState(false);
   const [activeRun, setActiveRun] = useState(null);

@@ -2,6 +2,7 @@
 from __future__ import annotations
 import os, io, base64, re, wave
 from typing import List, Optional, Literal, Union, Tuple, Set
+import json
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
@@ -105,6 +106,16 @@ OFFENDER_ALTERNATES = [
 # 유틸리티 함수들
 # ============================================
 CHAR_PATTERN = re.compile(r"[가-힣A-Za-z0-9]")
+
+def normalize_gender(g: Optional[str]) -> Optional[str]:
+    if not g:
+        return None
+    s = str(g).strip().lower()
+    if s in ("남", "남자", "m", "male"):
+        return "male"
+    if s in ("여", "여자", "f", "female"):
+        return "female"
+    return None
 
 def count_chars(token: str) -> int:
     return len(CHAR_PATTERN.findall(token))
@@ -293,7 +304,7 @@ def synthesize_case_dialogue(
         role = turn.get("role", "")
         if role == "victim":
             age = turn.get("age_group")
-            gender = turn.get("gender")
+            gender = normalize_gender(turn.get("gender"))
             v = choose_voice_name("victim", age, gender)
             victim_voices.add(v)
     
@@ -317,7 +328,7 @@ def synthesize_case_dialogue(
                 pass
         # 음성 선택
         age = turn.get("age_group")
-        gender = turn.get("gender")
+        gender = normalize_gender(turn.get("gender"))
         
         if role == "offender":
             vname = choose_voice_name("offender", age, gender, victim_voices)

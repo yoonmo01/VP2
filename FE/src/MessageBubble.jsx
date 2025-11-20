@@ -1,6 +1,8 @@
 // src/MessageBubble.jsx
 import { useEffect, useState } from "react";
-import { MessageCircleMore  , Brain, Box, Circle, Minus } from "lucide-react";  // ⭐ 라운드 구분용 아이콘
+import { MessageCircleMore, Brain, Box, Circle, Minus } from "lucide-react";  // ⭐ 라운드 구분용 아이콘
+import offenderMale from "./assets/offender_profile_1.png";
+import offenderFemale from "./assets/offender_profile_2.png";
 
 function getRiskColors(pct) {
   const v = Math.max(0, Math.min(100, Number(pct) || 0));
@@ -28,11 +30,13 @@ export default function MessageBubble({
   selectedCharacter,
   victimImageUrl,
   COLORS,
+  offenderId = 1,
 }) {
   const isVictim = message.sender === "victim";
   const isScammer = message.sender === "offender";
   const isSystem = message.sender === "system";
   const isRoundDivider = message.isRoundDivider === true;
+  const offenderImage = offenderId === 2 ? offenderFemale : offenderMale;
 
   const [parsed, setParsed] = useState({
     dialogue: "",
@@ -151,11 +155,13 @@ export default function MessageBubble({
                 {isScammer && (
                   <>
                     <img
-                      src={new URL("./assets/offender_profile.png", import.meta.url).href}
+                      src={offenderImage}
                       alt="피싱범"
                       className="w-9 h-9 rounded-full object-cover ring-2 ring-red-400/50"
                     />
-                    <span className="text-base font-semibold text-red-300">피싱범</span>
+                    <span className="text-base font-semibold text-red-300">
+                      피싱범
+                    </span>
                   </>
                 )}
 
