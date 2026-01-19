@@ -1,8 +1,20 @@
 # app/services/llm_providers.py
+import os
 from typing import Optional
 from app.core.config import settings
 from langchain_openai import ChatOpenAI
 from langchain_google_genai import ChatGoogleGenerativeAI
+
+
+def _openai_like_chat(model: str,
+                      base_url: str,
+                      api_key: str,
+                      temperature: float = 0.7):
+    return ChatOpenAI(model=model,
+                      base_url=base_url,
+                      api_key=api_key,
+                      temperature=temperature,
+                      timeout=600000)
 
 
 def openai_chat(model: Optional[str] = None, temperature: float = 0.7):
@@ -27,12 +39,35 @@ def openai_chat(model: Optional[str] = None, temperature: float = 0.7):
                           timeout=600000)
 
 
-def agent_chat():
+# STOP_SAFE_DEFAULT = "gpt-4o-2024-08-06"  # ReAct/stop 호환 안정판
+
+
+def agent_chat(model: str | None = None, temperature: float = 0.2):
+    name = model or getattr(settings, "AGENT_MODEL", None) #or STOP_SAFE_DEFAULT
+    # 'o4-mini' 같은 응답 API 전용 이름이 들어오면 안전 모델로 강제 매핑
+    alias_map = {
+        "o4-mini": "gpt-4o-mini-2024-07-18",  # 소형 버전 쓰고 싶으면 이걸로
+        "o4": "gpt-4o-2024-08-06",
+    }
+    name = alias_map.get(name, name)
+
+    if not settings.OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY not set")
+
     return ChatOpenAI(
-        model=getattr(settings, "AGENT_MODEL", "o4-mini"),
-        temperature=1,
+        model=name,
+        temperature=temperature,  # ReAct는 0~0.3 권장
+        api_key = settings.OPENAI_API_KEY,
         timeout=600000,
     )
+
+
+# def agent_chat():
+#     return ChatOpenAI(
+#         model=getattr(settings, "AGENT_MODEL", "o4-mini"),
+#         temperature=1,
+#         timeout=600000,
+#     )
 
 
 def gemini_chat(model: Optional[str] = None, temperature: float = 0.7):
@@ -52,10 +87,17 @@ def attacker_chat():
 
 
 def victim_chat():
-    provider = getattr(settings, "VICTIM_PROVIDER", "openai").lower()
+    provider = getattr(settings, "VICTIM_PROVIDER", "gemini").lower()
     model = settings.VICTIM_MODEL
     if provider == "gemini":
         return gemini_chat(model, temperature=0.7)
+    if provider == "local":
+        if not settings.LOCAL_BASE_URL:
+            raise RuntimeError("LOCAL_BASE_URL not set for local provider")
+        return _openai_like_chat(model,
+                                 settings.LOCAL_BASE_URL,
+                                 settings.LOCAL_API_KEY,
+                                 temperature=0.7)
     elif provider == "openai":
         return openai_chat(model, temperature=0.7)
     else:

@@ -22,14 +22,10 @@ const AIDisclaimerScroll = ({ COLORS }) => {
         </div>
       </div>
 
-      <style jsx>{`
+      <style>{`
         @keyframes scroll {
-          0% {
-            transform: translateX(0);
-          }
-          100% {
-            transform: translateX(-33.33%);
-          }
+          0% { transform: translateX(0); }
+          100% { transform: translateX(-33.33%); }
         }
 
         .animate-scroll {

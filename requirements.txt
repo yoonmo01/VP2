@@ -1,46 +1,38 @@
-# # Core
-# fastapi==0.111.0
-# uvicorn[standard]==0.30.0
-
-# # Config & Validation
-# pydantic==2.8.2
-# pydantic-settings==2.4.0
-# python-dotenv==1.0.1
-
-# # Database
-# SQLAlchemy==2.0.31
-# psycopg2-binary==2.9.9
-# alembic==1.13.2
-
-# # LLM / Agents
-# langchain==0.2.12
-# langchain-core==0.2.32
-# langchain-openai==0.1.21
-# langchain-google-genai==1.0.6
-# pandas==2.3.1
-
-
 # Core
 fastapi==0.111.0
-uvicorn[standard]==0.30.0
+uvicorn[standard]==0.35.0
 
 # Config & Validation
-pydantic==2.8.2
-pydantic-settings==2.4.0
+pydantic==2.11.1
+pydantic-settings==2.5.2
 python-dotenv==1.0.1
 
 # Database
 SQLAlchemy==2.0.31
-psycopg[binary]==3.2.*
+psycopg[binary]==3.2.10
 alembic==1.13.2
 
+# LLM / Agents
+langchain==0.3.27
+langchain-core==0.3.76
+langchain-openai==0.3.33
+langchain-google-genai==2.1.10
+langchain-community==0.3.27
+pandas==2.3.2
 
-# LLM / Agents (Updated Versions)
-langchain>=0.2.15
-langchain-core>=0.2.32
-langchain-openai>=0.2.3
-langchain-google-genai>=1.0.9
-pandas>=2.3.1
-langgraph>=0.2.28
-langchain-tavily>=0.1.0    # (옵션) Tavily 사용 시
-tavily-python>=0.5.0       # (옵션) Tavily 사용 시
+# LangGraph & Orchestration
+langgraph==0.6.7
+langgraph-checkpoint==2.1.1
+langgraph-prebuilt==0.6.4
+langgraph-sdk==0.2.6
+
+# Tavily
+langchain-tavily==0.2.11
+tavily-python==0.7.12
+
+# Networking
+websockets==15.0.1
+
+# MCP (Streamable HTTP + CLI)
+mcp==1.14.0
+anyio==4.10.0

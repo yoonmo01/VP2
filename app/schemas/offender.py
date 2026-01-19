@@ -1,14 +1,27 @@
 #app/schemas/offender.py
-from pydantic import BaseModel, ConfigDict, Field
-from typing import Any, Optional, Dict
+from pydantic import BaseModel, ConfigDict, Field, HttpUrl
+from typing import Any, Optional, Dict,List
 
 class OffenderCreate(BaseModel):
-    name: str
-    type: Optional[str] = None
-    profile: Dict[str, Any] = Field(default_factory=dict)   # 가변 기본값 안전
-    source: Dict[str, Any] = Field(default_factory=dict)    # {"title":..., "page":..., "url":...}
-    is_active: Optional[bool] = True
+    name: str = Field(..., max_length=100)
+    type: str = Field(..., max_length=50)
+    purpose: str
+    steps: List[str]
+class ProfileIn(BaseModel):
+    purpose: str
+    steps: List[str]
 
+class SourceIn(BaseModel):
+    title: str
+    page: str
+    url: HttpUrl | str  # 내부망/로컬도 허용하려면 str로 둬도 됨
+
+class OffenderCreateIn(BaseModel):
+    name: str
+    type: str
+    profile: ProfileIn
+    source: Optional[SourceIn] = None  # 프론트가 보낼 수도 있으니 허용
+    
 class OffenderOut(BaseModel):
     id: int
     name: str
