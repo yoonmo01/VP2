@@ -29,10 +29,28 @@ def _normalize_quotes(s: str) -> str:
          .replace("\u2018", "'").replace("\u2019", "'")
     )
 
+def _strip_action_input_prefix(s: str) -> str:
+    # LangChain 로그에 섞이는 "Action Input:" 같은 prefix 제거
+    m = re.search(r"(?:Action Input:|action_input:)\s*(.*)$", s.strip(), flags=re.I | re.S)
+    return (m.group(1).strip() if m else s.strip())
+
 def _extract_json_with_balancing(s: str) -> str:
-    start = s.find("{")
-    if start == -1:
+    """
+    문자열 안에서 첫 번째로 '완결되는' JSON 조각(객체/배열)을 추출한다.
+    - 입력이 {...}로 시작하지 않아도 됨 (앞에 설명/로그가 붙어도 됨)
+    - {...} 뿐 아니라 [...] 도 지원
+    """
+    s = s.strip()
+    start = None
+    start_ch = None
+    for idx, ch in enumerate(s):
+        if ch in "{[":
+            start = idx
+            start_ch = ch
+            break
+    if start is None or start_ch is None:
         return s.strip()
+
     stack, in_str, esc, end = [], False, False, None
     for i in range(start, len(s)):
         ch = s[i]
@@ -70,8 +88,11 @@ def _to_dict(obj: Any) -> Dict[str, Any]:
         return obj
 
     if isinstance(obj, str):
+        # 0) Action Input prefix 제거
+        s = _strip_action_input_prefix(obj)
+
         # 1) 코드펜스/스마트따옴표 제거
-        s = _normalize_quotes(_strip_code_fences(obj)).strip()
+        s = _normalize_quotes(_strip_code_fences(s)).strip()
 
         # 2) 따옴표 바깥의 주석/노트 제거(예: "# 예시", "(Note: ...)" 등은 JSON 앞뒤에 붙는 경우가 많음)
         #    → JSON 블록만 남기면 자연스레 제거됨
@@ -79,10 +100,22 @@ def _to_dict(obj: Any) -> Dict[str, Any]:
 
         # 3) JSON 우선 → 실패 시 literal_eval
         try:
-            return json.loads(core)
+            v = json.loads(core)
+            if isinstance(v, dict):
+                return v
+            # 배열이면 dict로 감싸서 기존 호출부 안전
+            if isinstance(v, list):
+                return {"data": v}
+            raise ValueError("JSON must be object/array")
+
         except Exception:
             try:
-                return ast.literal_eval(core)
+                v2 = ast.literal_eval(core)
+                if isinstance(v2, dict):
+                    return v2
+                if isinstance(v2, list):
+                    return {"data": v2}
+                raise ValueError("literal must be dict/list")
             except Exception:
                 raise HTTPException(status_code=422, detail="Action Input 'data'는 주석/설명 없이 올바른 JSON 객체여야 합니다.")
 
@@ -96,8 +129,16 @@ def _unwrap_data(obj: Any) -> Dict[str, Any]:
         return _to_dict(inner)
     return d
 
+def _normalize_role(role: str) -> str:
+    r = (role or "").strip().lower()
+    # 호환: attacker -> offender 로 통일
+    if r == "attacker":
+        return "offender"
+    return r
+
 def _assert_role_turn(turn_index: int, role: str):
     """짝수턴=offender, 홀수턴=victim 규칙 확인(로그 저장용)."""
+    role = _normalize_role(role)
     expected = "offender" if turn_index % 2 == 0 else "victim"
     if role not in ("offender", "victim"):
         raise HTTPException(status_code=422, detail="role must be 'offender' or 'victim'")
@@ -216,7 +257,7 @@ def make_sim_tools(db: Session):
             victim_id = int(payload["victim_id"])
             run_no = int(payload.get("run_no", 1))
             turn_index = int(payload["turn_index"])
-            role = str(payload["role"])
+            role = _normalize_role(str(payload["role"]))
         except KeyError as e:
             raise HTTPException(status_code=422, detail=f"Missing required field: {e.args[0]}")
         except (TypeError, ValueError):
@@ -242,7 +283,8 @@ def make_sim_tools(db: Session):
             guideline=guideline,
         )
         db.add(log); db.commit()
-        return f"ok:{log.id}"
+        # 다음 단계에서 파싱 깨지지 않게 dict 반환 권장
+        return {"ok": True, "id": log.id}
 
     @tool(
         "sim.should_stop",
@@ -259,8 +301,9 @@ def make_sim_tools(db: Session):
         try:
             attacker_text = str(payload.get("attacker_text") or "").lower()
             victim_text = str(payload.get("victim_text") or "").lower()
-            turn_index = int(payload.get("turn_index", 0))
-            max_turns = int(payload.get("max_turns", 15))
+            # 호환: cycle_index 라는 이름을 쓰는 경우도 허용
+            turn_index = int(payload.get("turn_index", payload.get("cycle_index", 0)) or 0)
+            max_turns = int(payload.get("max_turns", payload.get("max_cycles", 15)) or 15)
         except Exception:
             raise HTTPException(status_code=422, detail="should_stop 입력 형식 오류")
 

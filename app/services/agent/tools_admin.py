@@ -60,515 +60,286 @@ def _to_dict(obj: Any) -> Dict[str, Any]:
     if not isinstance(obj, str):
         raise HTTPException(status_code=422, detail=f"data는 JSON 객체여야 합니다. got type: {type(obj).__name__}")
 
-    s = obj.strip()
-
-    # 빈 문자열 체크
+    s = (obj or "").strip()
     if not s:
         raise HTTPException(status_code=422, detail="data가 비어있습니다.")
 
     logger.info("[_to_dict] 입력 길이: %d자", len(s))
 
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # ★★★ 0-1단계: 전역 Invalid escape 사전 제거
-    # 문자열 밖에서도 \} 같은 패턴을 } 로 변환
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    def global_fix_invalid_escapes(text: str) -> str:
+    # ─────────────────────────────────────────────────────────
+    # 안전한 전처리: LangChain/툴 로그 prefix, 코드펜스 제거
+    # ─────────────────────────────────────────────────────────
+    def _strip_wrappers(text: str) -> str:
+        t = text.strip()
+        # 예: "Action Input: {...}"
+        m = re.search(r"(?:Action Input:|action_input:)\s*([\{\[].*)$", t, flags=re.IGNORECASE | re.DOTALL)
+        if m:
+            t = m.group(1).strip()
+        # 코드펜스 제거
+        if t.startswith("```"):
+            t = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", t)
+            t = re.sub(r"\s*```$", "", t)
+            t = t.strip()
+        return t
+
+    # ─────────────────────────────────────────────────────────
+    # (추가) JSON 조각이 끝까지 닫히지 않았을 때, 부족한 닫는 괄호를 자동으로 보정
+    # ─────────────────────────────────────────────────────────
+    def _balance_json_fragment(text: str) -> Optional[str]:
         """
-        전역적으로 잘못된 이스케이프 패턴 제거.
-        NOTE: 기존 코드는 정규식 문자열을 str.replace로 처리해 사실상 동작이 약했음.
-        최소 침습으로 re.sub 사용.
+        첫 '{' 또는 '['부터 끝까지를 가져온 뒤,
+        문자열 영역은 무시하고 스택 기반으로 부족한 닫는 괄호를 자동으로 붙인다.
+        - LLM이 tool input 끝 괄호를 하나 빼먹는 케이스를 복구하기 위함
         """
-        # \} \] \) \{ \[ \( 형태에서 백슬래시 제거
-        return re.sub(r'\\([}\]\)\{\[\(])', r'\1', text)
-
-    s_global_fixed = global_fix_invalid_escapes(s)
-    if s_global_fixed != s:
-        logger.info("[_to_dict] 0-1단계: 전역 Invalid escape 제거 (%d → %d자)", len(s), len(s_global_fixed))
-        s = s_global_fixed
-
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # ★★★ 0-2단계: 깨진 JSON 구조 복구
-    # rolevictimtext{...} → {"role": "victim", "text": "..."}
-    # roleoffendertext{...} → {"role": "offender", "text": "..."}
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    def fix_broken_json_structure(text: str) -> str:
-        """깨진 JSON 구조 패턴을 올바른 형태로 복구"""
-        # rolevictimtext{content} 패턴
-        result = text
-
-        pattern1 = re.compile(r'rolevictimtext\{([^}]*)\}', re.DOTALL)
-        result = pattern1.sub(r'{"role": "victim", "text": "\1"}', result)
-
-        pattern2 = re.compile(r'roleoffendertext\{([^}]*)\}', re.DOTALL)
-        result = pattern2.sub(r'{"role": "offender", "text": "\1"}', result)
-
-        pattern3 = re.compile(r'rolevictimtext', re.DOTALL)
-        result = pattern3.sub(r'"role": "victim", "text": ', result)
-
-        pattern4 = re.compile(r'roleoffendertext', re.DOTALL)
-        result = pattern4.sub(r'"role": "offender", "text": ', result)
-
-        return result
-
-    s_structure_fixed = fix_broken_json_structure(s)
-    if s_structure_fixed != s:
-        logger.info("[_to_dict] 0-2단계: 깨진 JSON 구조 복구 (%d → %d자)", len(s), len(s_structure_fixed))
-        s = s_structure_fixed
-
-    def _try_parse(candidate: str) -> Optional[Dict[str, Any]]:
-        """JSON 또는 literal_eval 시도 - 개선된 버전"""
-        candidate = candidate.strip()
-        if not candidate:
+        t = _strip_wrappers(text)
+        if not t:
             return None
 
-        # ★★★ 0. Invalid escape sequence 처리
-        def fix_invalid_escapes(text: str) -> str:
-            """잘못된 이스케이프 시퀀스 수정"""
-            result: List[str] = []
-            i = 0
-            in_string = False
+        start = None
+        for i, ch in enumerate(t):
+            if ch in "{[":
+                start = i
+                break
+        if start is None:
+            return None
 
-            while i < len(text):
-                if text[i] == '"' and (i == 0 or text[i - 1] != '\\'):
-                    in_string = not in_string
-                    result.append(text[i])
-                    i += 1
-                elif in_string and text[i] == '\\' and i + 1 < len(text):
-                    next_char = text[i + 1]
-                    if next_char in '"\\/:bfnrtu':
-                        result.append(text[i])
-                        result.append(next_char)
-                        i += 2
-                    else:
-                        result.append(next_char)
-                        i += 2
-                else:
-                    result.append(text[i])
-                    i += 1
+        s2 = t[start:]
+        stack: List[str] = []
+        in_str = False
+        esc = False
 
-            return ''.join(result)
+        for ch in s2:
+            if in_str:
+                if esc:
+                    esc = False
+                    continue
+                if ch == "\\":
+                    esc = True
+                    continue
+                if ch == '"':
+                    in_str = False
+                continue
+            else:
+                if ch == '"':
+                    in_str = True
+                    continue
+                if ch == "{":
+                    stack.append("}")
+                elif ch == "[":
+                    stack.append("]")
+                elif ch in ("}", "]"):
+                    if stack and stack[-1] == ch:
+                        stack.pop()
 
-        # 1. JSON 파싱
-        try:
-            v = json.loads(candidate)
-            if isinstance(v, dict):
-                return v
-        except json.JSONDecodeError as e:
-            if "Invalid" in str(e) and "escape" in str(e):
-                try:
-                    fixed = fix_invalid_escapes(candidate)
-                    v = json.loads(fixed)
-                    if isinstance(v, dict):
-                        logger.info("[_try_parse] Invalid escape 수정 후 성공")
-                        return v
-                except json.JSONDecodeError:
-                    pass
+        if stack:
+            s2 = s2 + "".join(reversed(stack))
+        return s2
 
-        # ★★★ 1-1. Invalid control character 에러 처리 (강화)
-        try:
-            cleaned = candidate.replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t')
-            if cleaned != candidate:
-                v = json.loads(cleaned)
-                if isinstance(v, dict):
-                    logger.info("[_try_parse] 제어문자 이스케이프 후 성공")
-                    return v
-        except json.JSONDecodeError:
-            pass
+    # ─────────────────────────────────────────────────────────
+    # 첫 번째로 "완결되는" JSON 조각만 추출 (추가 텍스트/로그 섞임 방지)
+    # ─────────────────────────────────────────────────────────
+    def _extract_first_json_fragment(text: str) -> Optional[str]:
+        t = _strip_wrappers(text)
+        if not t:
+            return None
 
-        # 2. literal_eval
-        try:
-            v = ast.literal_eval(candidate)
-            if isinstance(v, dict):
-                return v
-        except (ValueError, SyntaxError):
-            pass
+        start = None
+        start_ch = None
+        for i, ch in enumerate(t):
+            if ch in "{[":
+                start = i
+                start_ch = ch
+                break
+        if start is None or start_ch is None:
+            return None
 
-        # 3. 코드펜스 제거 후 재파싱
-        fence_pattern = re.compile(r'^```(?:json)?\s*(.*?)\s*```$', re.DOTALL)
-        fence_match = fence_pattern.match(candidate)
-        if fence_match:
-            clean = fence_match.group(1).strip()
-            try:
-                v = json.loads(clean)
-                if isinstance(v, dict):
-                    return v
-            except json.JSONDecodeError:
-                pass
-
-        # 4. 첫 { 부터 마지막 } 까지만 추출
-        first_brace = candidate.find('{')
-        last_brace = candidate.rfind('}')
-        if first_brace != -1 and last_brace != -1 and first_brace < last_brace:
-            extracted = candidate[first_brace:last_brace + 1]
-            if extracted != candidate:
-                try:
-                    v = json.loads(extracted)
-                    if isinstance(v, dict):
-                        return v
-                except json.JSONDecodeError:
-                    pass
-
+        end_ch = "}" if start_ch == "{" else "]"
+        depth = 0
+        in_str = False
+        esc = False
+        for j in range(start, len(t)):
+            ch = t[j]
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+                continue
+            else:
+                if ch == '"':
+                    in_str = True
+                    continue
+                if ch == start_ch:
+                    depth += 1
+                elif ch == end_ch:
+                    depth -= 1
+                    if depth == 0:
+                        return t[start : j + 1]
         return None
 
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # ★★★ 0단계: 작은따옴표로 감싸진 JSON 값 정리
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    def normalize_quoted_json(text: str) -> str:
-        """
-        "text": '{"key": "value"}' 같은 패턴을
-        "text": "{\"key\": \"value\"}" 형태로 변환
-        """
-        pattern = r'("[^"]+"\s*:\s*)\'([^\']*(?:\'\'[^\']*)*)\'(?=\s*[,}\]])'
-
-        def replace_func(match):
-            prefix = match.group(1)
-            content = match.group(2)
-            content_escaped = content.replace('"', '\\"')
-            return f'{prefix}"{content_escaped}"'
-
-        return re.sub(pattern, replace_func, text)
-
-    s_normalized = normalize_quoted_json(s)
-    if s_normalized != s:
-        logger.info("[_to_dict] 0단계: 작은따옴표 JSON 값 정규화")
-        val = _try_parse(s_normalized)
-        if val is not None:
-            logger.info("[_to_dict] 0단계 성공")
-            return val
-        s = s_normalized
-
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # 1단계: 전체 문자열 직접 파싱
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    val = _try_parse(s)
-    if val is not None:
-        logger.info("[_to_dict] 1단계 성공 (전체 문자열)")
-        return val
-
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # ★★★ 1-2단계: 제어문자 사전 정리 후 재시도
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    s_cleaned_ctrl = s.replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t')
-    if s_cleaned_ctrl != s:
-        logger.info("[_to_dict] 1-2단계: 전체 문자열 제어문자 정리")
-        val = _try_parse(s_cleaned_ctrl)
-        if val is not None:
-            logger.info("[_to_dict] 1-2단계 성공 (제어문자 정리)")
-            return val
-        s = s_cleaned_ctrl
-
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # 2단계: "data" 키 뒤의 {...} 블록만 추출
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    data_keyword_pos = s.find('"data"')
-    if data_keyword_pos == -1:
-        data_keyword_pos = s.find("'data'")
-
-    if data_keyword_pos != -1:
-        colon_pos = s.find(":", data_keyword_pos)
-        if colon_pos != -1:
-            search_start = colon_pos + 1
-            while search_start < len(s) and s[search_start] in ' \t\n\r':
-                search_start += 1
-
-            if search_start < len(s) and s[search_start] == '{':
-                depth = 0
-                end_pos = None
-                in_string = False
-                escape_next = False
-
-                for i in range(search_start, len(s)):
-                    ch = s[i]
-
-                    if escape_next:
-                        escape_next = False
-                        continue
-
-                    if ch == '\\':
-                        escape_next = True
-                        continue
-
-                    if ch == '"':
-                        in_string = not in_string
-                        continue
-
-                    if not in_string:
-                        if ch == '{':
-                            depth += 1
-                        elif ch == '}':
-                            depth -= 1
-                            if depth == 0:
-                                end_pos = i
-                                break
-
-                if end_pos is not None:
-                    inner_block = s[search_start:end_pos + 1]
-                    logger.info("[_to_dict] 2단계: data 블록 추출 (%d자)", len(inner_block))
-
-                    val = _try_parse(inner_block)
-                    if val is not None:
-                        logger.info("[_to_dict] 2단계 성공 (data 블록 파싱)")
-                        return {"data": val}
-
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # 3단계: 전체에서 가장 큰 {...} 블록 추출
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    m_big = re.search(r"\{.*\}", s, re.DOTALL)
-    if m_big:
-        sub = m_big.group(0)
-        logger.info("[_to_dict] 3단계: 정규식 추출 (%d자)", len(sub))
-        val = _try_parse(sub)
-        if val is not None:
-            logger.info("[_to_dict] 3단계 성공")
-            return val
-
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # 4단계: 끝의 불필요한 문자(], }) 제거 시도
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    tmp = s
-    for attempt in range(10):
-        tmp = tmp.rstrip()
-        if not tmp:
-            break
-        if tmp[-1] in ']}':
-            tmp = tmp[:-1]
-            val = _try_parse(tmp)
-            if val is not None:
-                logger.warning("[_to_dict] 4단계 성공 (끝 문자 %d개 제거)", attempt + 1)
-                return val
-        else:
-            break
-
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # 5단계: 중괄호 부족/과다 감지 및 수정 시도 (강화 버전)
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    s_cleaned = s.rstrip()
-
-    removed_total = 0
-    for _ in range(5):
-        if not s_cleaned:
-            break
-        s_cleaned = s_cleaned.rstrip()
-        if s_cleaned and s_cleaned[-1] in ']}':
-            s_cleaned = s_cleaned[:-1]
-            removed_total += 1
-        else:
-            break
-
-    if removed_total > 0 or s_cleaned != s:
-        logger.info("[_to_dict] 5단계 전: 공백+괄호 %d개 제거", removed_total)
-        val = _try_parse(s_cleaned)
-        if val is not None:
-            logger.warning("[_to_dict] 5단계 성공 (공백+괄호 제거)")
-            return val
-        s = s_cleaned
-
-    # 문자열 내부 제외하고 카운트
-    def count_brackets(text: str) -> tuple:
-        open_b = 0
-        close_b = 0
-        open_sq = 0
-        close_sq = 0
-        in_string = False
-        escape = False
-
-        for ch in text:
-            if escape:
-                escape = False
-                continue
-            if ch == '\\':
-                escape = True
-                continue
-            if ch == '"':
-                in_string = not in_string
-                continue
-            if not in_string:
-                if ch == '{':
-                    open_b += 1
-                elif ch == '}':
-                    close_b += 1
-                elif ch == '[':
-                    open_sq += 1
-                elif ch == ']':
-                    close_sq += 1
-
-        return open_b, close_b, open_sq, close_sq
-
-    open_braces, close_braces, open_brackets, close_brackets = count_brackets(s)
-
-    logger.info(
-        "[_to_dict] 5단계: 괄호 카운트 - 중괄호 열림:{%d} 닫힘:{%d}, 대괄호 열림:[%d] 닫힘:]%d]",
-        open_braces, close_braces, open_brackets, close_brackets
-    )
-
-    s_fixed = s
-    modifications = []
-
-    if open_braces > close_braces:
-        missing = open_braces - close_braces
-        s_fixed = s_fixed + ('}' * missing)
-        modifications.append(f"}} {missing}개")
-        logger.info("[_to_dict] 5단계: 닫는 } %d개 추가 시도", missing)
-
-    if open_brackets > close_brackets:
-        missing = open_brackets - close_brackets
-        s_fixed = s_fixed + (']' * missing)
-        modifications.append(f"] {missing}개")
-        logger.info("[_to_dict] 5단계: 닫는 ] %d개 추가 시도", missing)
-
-    if modifications:
-        logger.info("[_to_dict] 5단계: 괄호 보정 완료 (%s)", ", ".join(modifications))
-        val = _try_parse(s_fixed)
-        if val is not None:
-            logger.warning("[_to_dict] 5단계 성공 (괄호 보정: %s)", ", ".join(modifications))
-            return val
-        s = s_fixed
-
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # 6단계: 이스케이프 변환 시도
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    if '\\n' in s or "\\'" in s or '\\t' in s:
-        logger.info("[_to_dict] 6단계: 이스케이프 변환 시도")
-        cleaned = s.replace('\\n', '\n').replace('\\t', '\t').replace('\\r', '\r').replace("\\'", "'")
-        val = _try_parse(cleaned)
-        if val is not None:
-            logger.warning("[_to_dict] 6단계 성공 (이스케이프 변환)")
-            return val
-
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # ★★★ 7단계: 중첩된 JSON 문자열 처리 (신규)
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    def fix_nested_json_strings(text: str) -> str:
-        """작은따옴표로 감싸진 JSON 값을 큰따옴표로 변환하고 내부 따옴표를 이스케이프"""
-        result: List[str] = []
+    # ─────────────────────────────────────────────────────────
+    # JSON 문자열 내부에서만 invalid escape 제거 (예: "\}" -> "}")
+    # ─────────────────────────────────────────────────────────
+    _VALID_ESC = set('"\\/bfnrtu')
+    def _fix_invalid_escapes_in_strings(text: str) -> str:
+        out: List[str] = []
+        in_str = False
         i = 0
-
         while i < len(text):
-            if i < len(text) - 3 and text[i] == '"':
-                key_start = i
+            ch = text[i]
+            if ch == '"' and (i == 0 or text[i-1] != "\\"):
+                in_str = not in_str
+                out.append(ch)
                 i += 1
-                while i < len(text) and text[i] != '"':
-                    if text[i] == '\\':
-                        i += 2
-                    else:
-                        i += 1
-
-                if i < len(text):
-                    i += 1  # 닫는 "
-                    while i < len(text) and text[i] in ' \t\n\r':
-                        i += 1
-
-                    if i < len(text) and text[i] == ':':
-                        result.append(text[key_start:i + 1])
-                        i += 1
-                        while i < len(text) and text[i] in ' \t\n\r':
-                            result.append(text[i])
-                            i += 1
-
-                        if i < len(text) and text[i] == "'":
-                            i += 1
-                            escaped_value: List[str] = []
-
-                            while i < len(text) and text[i] != "'":
-                                if text[i] == '"':
-                                    escaped_value.append('\\"')
-                                elif text[i] == '\\' and i + 1 < len(text) and text[i + 1] == "'":
-                                    escaped_value.append("'")
-                                    i += 1
-                                else:
-                                    escaped_value.append(text[i])
-                                i += 1
-
-                            result.append('"')
-                            result.extend(escaped_value)
-                            result.append('"')
-
-                            if i < len(text) and text[i] == "'":
-                                i += 1
-                            continue
-
-            # ✅ 방어 가드: i가 len(text)로 점프한 뒤 text[i] 접근 방지
-            if i >= len(text):
-                break
-            result.append(text[i])
+                continue
+            if in_str and ch == "\\" and i + 1 < len(text):
+                nxt = text[i + 1]
+                # 유효한 escape면 그대로 둠
+                if nxt in _VALID_ESC:
+                    out.append("\\")
+                    out.append(nxt)
+                    i += 2
+                    continue
+                # invalid escape면 백슬래시 제거하고 문자만 남김
+                out.append(nxt)
+                i += 2
+                continue
+            out.append(ch)
             i += 1
+        return "".join(out)
 
-        return ''.join(result)
+    # ─────────────────────────────────────────────────────────
+    # JSON 문자열 내부의 실제 제어문자(\n,\r,\t)를 escape 처리
+    # (바깥 텍스트는 건드리지 않음)
+    # ─────────────────────────────────────────────────────────
+    def _escape_control_chars_in_strings(text: str) -> str:
+        out: List[str] = []
+        in_str = False
+        esc = False
+        for ch in text:
+            if in_str:
+                if esc:
+                    out.append(ch)
+                    esc = False
+                    continue
+                if ch == "\\":
+                    out.append(ch)
+                    esc = True
+                    continue
+                if ch == '"':
+                    out.append(ch)
+                    in_str = False
+                    continue
+                # 문자열 내부 제어문자만 이스케이프
+                if ch == "\n":
+                    out.append("\\n"); continue
+                if ch == "\r":
+                    out.append("\\r"); continue
+                if ch == "\t":
+                    out.append("\\t"); continue
+                out.append(ch)
+                continue
+            else:
+                if ch == '"':
+                    out.append(ch)
+                    in_str = True
+                    continue
+                out.append(ch)
+        return "".join(out)
 
-    s_nested_fixed = fix_nested_json_strings(s)
-    if s_nested_fixed != s:
-        logger.info("[_to_dict] 7단계: 중첩 JSON 문자열 처리")
-        val = _try_parse(s_nested_fixed)
-        if val is not None:
-            logger.warning("[_to_dict] 7단계 성공 (중첩 JSON 처리)")
-            return val
-        s = s_nested_fixed
+    # ─────────────────────────────────────────────────────────
+    # 파싱 루틴: "추출 → json.loads → (escape fixes) → 재시도"
+    # ─────────────────────────────────────────────────────────
+    def _parse_json_dict(candidate: str) -> Optional[Dict[str, Any]]:
+        c = candidate.strip()
+        if not c:
+            return None
+        try:
+            v = json.loads(c)
+            if isinstance(v, dict):
+                return v
+            # 배열이면 기존 호환을 위해 dict로 감싸기
+            if isinstance(v, list):
+                return {"data": v}
+            return None
+        except json.JSONDecodeError as e:
+            # invalid escape / control char 케이스만 단계적으로 수정
+            msg = (e.msg or "").lower()
+            c2 = c
+            changed = False
+            if "invalid" in msg and "escape" in msg:
+                c2 = _fix_invalid_escapes_in_strings(c2)
+                changed = True
+            if "invalid control character" in msg:
+                c2 = _escape_control_chars_in_strings(c2)
+                changed = True
+            if changed and c2 != c:
+                try:
+                    v2 = json.loads(c2)
+                    if isinstance(v2, dict):
+                        logger.info("[_to_dict] escape/control 보정 후 파싱 성공")
+                        return v2
+                    if isinstance(v2, list):
+                        return {"data": v2}
+                except json.JSONDecodeError:
+                    pass
+            return None
 
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # ★★★ 8단계: 모든 처리를 조합하여 최종 시도
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    logger.info("[_to_dict] 8단계: 종합 처리 시도")
-    s_final = s
+    # 1) 원문에서 바로 시도
+    s0 = _strip_wrappers(s)
+    v = _parse_json_dict(s0)
+    if v is not None:
+        logger.info("[_to_dict] 1단계 성공 (전체 문자열)")
+        return v
 
-    s_final = global_fix_invalid_escapes(s_final)
-    s_final = fix_broken_json_structure(s_final)
-    s_final = normalize_quoted_json(s_final)
-    s_final = fix_nested_json_strings(s_final)
-    s_final = s_final.replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t')
+    # 2) 첫 JSON 조각만 추출해서 시도
+    frag = _extract_first_json_fragment(s)
+    if frag:
+        logger.info("[_to_dict] 2단계: JSON 조각 추출 (%d자)", len(frag))
+        v = _parse_json_dict(frag)
+        if v is not None:
+            logger.info("[_to_dict] 2단계 성공 (조각 파싱)")
+            return v
 
-    open_b, close_b, open_sq, close_sq = count_brackets(s_final)
-    if open_b > close_b:
-        s_final += '}' * (open_b - close_b)
-    if open_sq > close_sq:
-        s_final += ']' * (open_sq - close_sq)
+    # 2.5) (추가) 괄호 누락/미완결 JSON 복구 시도
+    frag2 = _balance_json_fragment(s)
+    if frag2 and frag2 != frag:
+        logger.info("[_to_dict] 2.5단계: JSON 보정 조각 추출 (%d자)", len(frag2))
+        v = _parse_json_dict(frag2)
+        if v is not None:
+            logger.info("[_to_dict] 2.5단계 성공 (보정 조각 파싱)")
+            return v
 
-    if s_final != s:
-        val = _try_parse(s_final)
-        if val is not None:
-            logger.warning("[_to_dict] 8단계 성공 (종합 처리)")
-            return val
-
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # 모든 시도 실패
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    logger.error("[_to_dict] 모든 파싱 시도 실패")
-    logger.error("[_to_dict] 입력 앞 500자: %s", s[:500])
-    logger.error("[_to_dict] 입력 뒤 500자: %s", s[-500:])
-
-    # JSON 구조 진단
+    # 3) 최후: python literal_eval (JSON 유사 dict일 때만)
+    #    (단, 이건 안전을 위해 매우 제한적으로 사용)
     try:
-        json.loads(s)
+        maybe = ast.literal_eval(s0)
+        if isinstance(maybe, dict):
+            logger.info("[_to_dict] 3단계 성공 (literal_eval)")
+            return maybe
+    except Exception:
+        pass
+
+    # 실패: 더 이상 "고쳐쓰기" 하지 말고 원인 파악 가능한 로그만 남기고 종료
+    head = s0[:500]
+    tail = s0[-500:] if len(s0) > 500 else s0
+    logger.error("[_to_dict] 파싱 실패")
+    logger.error("[_to_dict] 입력 앞 500자: %s", head)
+    logger.error("[_to_dict] 입력 뒤 500자: %s", tail)
+
+    # 에러 위치를 남기기 위해 json.loads를 한번 더 시도해 위치 로그
+    try:
+        json.loads(frag2 or frag or s0)
     except json.JSONDecodeError as e:
-        logger.error("[_to_dict] JSON 파싱 에러: %s (위치: %d / 전체길이: %d)", e.msg, e.pos, len(s))
+        logger.error("[_to_dict] JSONDecodeError: %s (pos=%d, len=%d)", e.msg, e.pos, len(frag or s0))
+        ctx = (frag2 or frag or s0)
+        cs = max(0, e.pos - 120)
+        ce = min(len(ctx), e.pos + 120)
+        logger.error("[_to_dict] 에러 주변(±120): %s", ctx[cs:ce])
 
-        context_start = max(0, e.pos - 100)
-        context_end = min(len(s), e.pos + 100)
-        logger.error("[_to_dict] 에러 위치 주변 (±100자):")
-        logger.error("    %s", s[context_start:context_end])
-
-        if "Unterminated string" in e.msg:
-            logger.error("[_to_dict] ⚠️  문자열이 중간에 잘렸습니다")
-            logger.error("[_to_dict] ⚠️  원인: 에이전트 출력 길이 제한 또는 LLM 응답 불완전")
-            logger.error("[_to_dict] ⚠️  해결: max_iterations 증가 또는 데이터 분할 전송")
-
-        if "Expecting" in e.msg:
-            logger.error("[_to_dict] ⚠️  JSON 구조 오류: %s", e.msg)
-            logger.error("[_to_dict] ⚠️  에이전트가 잘못된 JSON을 생성했을 가능성")
-
-        if "Invalid control character" in e.msg:
-            logger.error("[_to_dict] ⚠️  제어 문자 오류: JSON 문자열 내부에 이스케이프되지 않은 개행문자 존재")
-            logger.error("[_to_dict] ⚠️  원인: 에이전트가 \\n 대신 실제 개행문자를 사용")
-            logger.error("[_to_dict] ⚠️  해결: 0단계, 1-2단계, 7-8단계에서 자동 처리 시도했으나 실패")
-
-        if "Invalid" in e.msg and "escape" in e.msg:
-            logger.error("[_to_dict] ⚠️  잘못된 이스케이프 시퀀스: \\} 같은 잘못된 이스케이프 존재")
-            logger.error("[_to_dict] ⚠️  원인: 에이전트가 유효하지 않은 이스케이프 시퀀스 생성")
-            logger.error("[_to_dict] ⚠️  해결: _try_parse의 fix_invalid_escapes로 자동 처리 시도했으나 실패")
-
-    raise HTTPException(
-        status_code=422,
-        detail="data는 JSON 객체여야 합니다. 파싱 실패."
-    )
+    raise HTTPException(status_code=422, detail="data는 JSON 객체여야 합니다. 파싱 실패.")
 
 
 def _unwrap_data(obj: Any) -> Dict[str, Any]:
@@ -651,14 +422,14 @@ class _MakePreventionInput(BaseModel):
 # ─────────────────────────────────────────────────────────
 def _is_terminal_case(rounds: int, judgements: List[Dict[str, Any]]) -> Tuple[bool, str]:
     """
-    rounds 가 3 이상이거나, judgements 중 risk.level == 'critical' 이 하나라도 있으면 터미널로 간주.
-    return: (is_terminal, reason)  # reason in {"round3", "critical", "not_terminal"}
+    rounds 가 2 이상이거나, judgements 중 risk.level == 'critical' 이 하나라도 있으면 터미널로 간주.
+    return: (is_terminal, reason)  # reason in {"round2", "critical", "not_terminal"}
     """
     logger.info(f"[_is_terminal_case] rounds={rounds}, judgements count={len(judgements or [])}")
 
     try:
-        if rounds >= 3:
-            return True, "round3"
+        if rounds >= 2:
+            return True, "round2"
 
         for idx, j in enumerate(judgements or []):
             logger.info(f"[_is_terminal_case] judgement[{idx}]: {j}")
@@ -1116,15 +887,28 @@ def make_admin_tools(db: Session, guideline_repo):
         previous_judgements = payload.get("previous_judgements") or []
 
         try:
-            result = dynamic_generator.generate_guidance(
-                db=db,
-                case_id=str(case_uuid),
-                round_no=run_no,
-                scenario=scenario,
-                victim_profile=victim_profile,
-                previous_judgments=previous_judgements,
-                verdict=verdict,
-            )
+            # guidance_generator 쪽 파라미터명이 (previous_judgments / previous_judgements)로
+            # 엇갈릴 수 있어서 TypeError 시 폴백
+            try:
+                result = dynamic_generator.generate_guidance(
+                    db=db,
+                    case_id=str(case_uuid),
+                    round_no=run_no,
+                    scenario=scenario,
+                    victim_profile=victim_profile,
+                    previous_judgments=previous_judgements,
+                    verdict=verdict,
+                )
+            except TypeError:
+                result = dynamic_generator.generate_guidance(
+                    db=db,
+                    case_id=str(case_uuid),
+                    round_no=run_no,
+                    scenario=scenario,
+                    victim_profile=victim_profile,
+                    previous_judgements=previous_judgements,
+                    verdict=verdict,
+                )
         except Exception as e:
             logger.exception("[admin.generate_guidance] 실패")
             return {"ok": False, "error": f"generator_failed: {e!s}"}
@@ -1161,7 +945,7 @@ def make_admin_tools(db: Session, guideline_repo):
             return {
                 "ok": False,
                 "error": "not_terminal",
-                "message": "prevention can be generated only at round 3 or when risk is critical",
+                "message": "prevention can be generated only at round 2+ or when risk is critical",
                 "rounds": pi.rounds,
             }
 
@@ -1173,7 +957,8 @@ def make_admin_tools(db: Session, guideline_repo):
                 "analysis": {
                     "outcome": "success|fail",
                     "reasons": ["string", "string", "string"],
-                    "risk_level": "low|medium|high"
+                    # verdict에서 critical도 올 수 있어 허용 범위 확장
+                    "risk_level": "low|medium|high|critical"
                 },
                 "steps": ["명령형 한국어 단계 5~9개"],
                 "tips": ["체크리스트형 팁 3~6개"]

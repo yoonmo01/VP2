@@ -44,7 +44,9 @@ MIN_ROUNDS = 2
 MAX_ROUNDS_DEFAULT = 5
 MAX_ROUNDS_UI_LIMIT = 5
 
-_PROMPT_CACHE: Dict[str, Dict[str, str]] = {}
+# 전역 캐시를 유지하되 "stream_id 스코프"를 강제한다.
+# (기존 로직은 finally에서 "round_" 포함 키를 싹 지워서 다른 케이스 캐시까지 오염/삭제 가능)
+_PROMPT_CACHE: Dict[str, Dict[str, Any]] = {}
 
 # SSE 모듈
 import asyncio, logging, uuid, contextvars, contextlib, sys
@@ -56,6 +58,20 @@ _StreamState = Tuple[asyncio.AbstractEventLoop, asyncio.Queue, Set[asyncio.Queue
 
 _STREAMS: dict[str, _StreamState] = {}
 _current_stream_id: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("_current_stream_id", default=None)
+
+def _sse_enabled(payload: Optional[Dict[str, Any]] = None) -> bool:
+    """
+    CLI/배치에서는 SSE가 필요 없고, running loop가 없어서 크래시가 난다.
+    - payload.disable_sse==True 또는 env VP_DISABLE_SSE=1 이면 SSE 전부 비활성화
+    """
+    try:
+        if payload and bool(payload.get("disable_sse")):
+            return False
+        if os.getenv("VP_DISABLE_SSE", "").strip() in ("1", "true", "TRUE", "yes", "YES"):
+            return False
+    except Exception:
+        pass
+    return True
 
 _ACTIVE_STREAMS: Set[str] = set()
 _ACTIVE_RUN_KEYS: Set[str] = set()
@@ -112,7 +128,14 @@ def _parsing_error_handler(error: Exception) -> str:
 def _ensure_stream(stream_id: str) -> _StreamState:
     state = _STREAMS.get(stream_id)
     if state is None:
-        loop = asyncio.get_running_loop()
+        # FastAPI(SSE)에서는 running loop가 있지만, CLI에서는 없다.
+        # CLI에서는 _ensure_stream 자체를 안 타게 하는 게 정석이지만,
+        # 혹시라도 호출되면 안전하게 예외를 피한다.
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
         main_q: asyncio.Queue = asyncio.Queue()
         sinks: Set[asyncio.Queue] = set()
         state = (loop, main_q, sinks)
@@ -476,6 +499,204 @@ def _loose_parse_json(obj: Any) -> Dict[str, Any]:
             pass
     return {}
 
+def _strip_action_input_wrappers(text: str) -> str:
+    """
+    LLM이 생성한 Action Input 문자열에서 흔한 래퍼를 제거:
+    - "Action Input:" prefix
+    - 코드펜스 ```json ... ```
+    """
+    t = (text or "").strip()
+    # "Action Input: {...}" / "action_input: {...}"
+    m = re.search(r"(?:Action Input:|action_input:)\s*([\{\[].*)$", t, flags=re.IGNORECASE | re.DOTALL)
+    if m:
+        t = m.group(1).strip()
+    # 코드펜스 제거
+    if t.startswith("```"):
+        t = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", t)
+        t = re.sub(r"\s*```$", "", t)
+        t = t.strip()
+    return t
+
+def _extract_first_json_fragment(text: str) -> Optional[str]:
+    """
+    문자열에서 첫 번째로 "완결되는" JSON 객체/배열 조각만 추출한다.
+    (뒤에 설명/로그가 붙어도 Extra data를 방지)
+    """
+    t = _strip_action_input_wrappers(text)
+    if not t:
+        return None
+    start = None
+    start_ch = None
+    for i, ch in enumerate(t):
+        if ch in "{[":
+            start = i
+            start_ch = ch
+            break
+    if start is None or start_ch is None:
+        return None
+    end_ch = "}" if start_ch == "{" else "]"
+    depth = 0
+    in_str = False
+    esc = False
+    for j in range(start, len(t)):
+        ch = t[j]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        else:
+            if ch == '"':
+                in_str = True
+                continue
+            if ch == start_ch:
+                depth += 1
+            elif ch == end_ch:
+                depth -= 1
+                if depth == 0:
+                    return t[start : j + 1]
+    return None
+
+def _balance_json_fragment(text: str) -> Optional[str]:
+    """
+    LLM이 마지막 '}' 같은 닫는 괄호를 빠뜨린 케이스 복구.
+    첫 '{'/'['부터 끝까지를 가져와 문자열 영역은 무시하고 부족한 닫는 괄호를 자동으로 붙인다.
+    """
+    t = _strip_action_input_wrappers(text)
+    if not t:
+        return None
+    start = None
+    for i, ch in enumerate(t):
+        if ch in "{[":
+            start = i
+            break
+    if start is None:
+        return None
+    s2 = t[start:]
+    stack: List[str] = []
+    in_str = False
+    esc = False
+    for ch in s2:
+        if in_str:
+            if esc:
+                esc = False
+                continue
+            if ch == "\\":
+                esc = True
+                continue
+            if ch == '"':
+                in_str = False
+            continue
+        else:
+            if ch == '"':
+                in_str = True
+                continue
+            if ch == "{":
+                stack.append("}")
+            elif ch == "[":
+                stack.append("]")
+            elif ch in ("}", "]"):
+                if stack and stack[-1] == ch:
+                    stack.pop()
+    if stack:
+        s2 = s2 + "".join(reversed(stack))
+    return s2
+
+def _robust_action_input_to_dict(data: Any) -> Optional[Dict[str, Any]]:
+    """
+    에이전트가 넘긴 tool input을 최대한 dict로 복구한다.
+    - dict면 그대로
+    - str이면: (1) strip → (2) 완결 JSON 조각 파싱 → (3) balance 보정 파싱 → (4) literal_eval
+    """
+    if isinstance(data, dict):
+        return data
+    if not isinstance(data, str):
+        return None
+    s = data.strip()
+    if not s:
+        return None
+
+    # 1) 완결 조각
+    frag = _extract_first_json_fragment(s)
+    if frag:
+        try:
+            obj = json.loads(frag)
+            if isinstance(obj, dict):
+                return obj
+            if isinstance(obj, list):
+                return {"data": obj}
+        except Exception:
+            pass
+
+    # 2) 괄호 보정 조각
+    frag2 = _balance_json_fragment(s)
+    if frag2:
+        try:
+            obj = json.loads(frag2)
+            if isinstance(obj, dict):
+                return obj
+            if isinstance(obj, list):
+                return {"data": obj}
+        except Exception:
+            pass
+
+    # 3) 최후: python literal (매우 제한적으로)
+    try:
+        t = _strip_action_input_wrappers(s)
+        obj = ast.literal_eval(t)
+        if isinstance(obj, dict):
+            return obj
+        if isinstance(obj, list):
+            return {"data": obj}
+    except Exception:
+        return None
+    return None
+
+def _wrap_tool_force_json_input(original_tool, *, require_data_wrapper: bool = True):
+    """
+    ReAct 에이전트가 Action Input을 문자열로 망가뜨려도,
+    orchestrator에서 먼저 dict로 복구해서 original_tool.invoke(dict)로 넘긴다.
+    """
+    from langchain_core.tools import tool
+    from typing import Any
+
+    @tool
+    def _wrapped(data: Any) -> Any:
+        """
+        Proxy wrapper for a LangChain tool.
+        Ensures Action Input is parsed into a dict and forwarded to original_tool.invoke().
+        """
+        parsed = _robust_action_input_to_dict(data)
+        if not isinstance(parsed, dict) or not parsed:
+            # 원문 일부만 반환(디버깅)
+            return {
+                "ok": False,
+                "error": "tool_input_parse_failed",
+                "message": "Action Input을 JSON(dict)로 파싱하지 못했습니다.",
+                "raw_preview": (str(data)[:500] if data is not None else None),
+            }
+
+        if require_data_wrapper:
+            # 도구가 SingleData(args_schema=SingleData) 스타일이면 {"data": ...} 형태로 보장
+            if "data" not in parsed:
+                parsed = {"data": parsed}
+
+        try:
+            return original_tool.invoke(parsed)
+        except Exception as e:
+            return {
+                "ok": False,
+                "error": "tool_invoke_failed",
+                "message": str(e),
+            }
+
+    _wrapped.name = original_tool.name
+    _wrapped.description = getattr(original_tool, "description", "") or ""
+    return _wrapped
+
 def _last_observation(cap: "ThoughtCapture", tool_name: str) -> Any:
     for ev in reversed(cap.events):
         if ev.get("type") == "observation" and ev.get("tool") == tool_name:
@@ -751,47 +972,8 @@ def _wrap_sim_compose_prompts(original_tool):
     def sim_compose_prompts_cached(data: Any) -> dict:
         """프롬프트 생성 후 캐시에 저장하고 prompt_id만 반환"""
 
-        # ★★★ 디버깅: 원본 입력 로깅
-        logger.info(f"[PromptCache] 원본 data 타입: {type(data)}")
-        if isinstance(data, str):
-            logger.info(f"[PromptCache] 원본 data 길이: {len(data)}")
-            logger.info(f"[PromptCache] 원본 data 전체: {data}")  # ★ 전체 출력으로 변경
-        else:
-            logger.info(f"[PromptCache] 원본 data: {data}")
-
-        # 1) 문자열 → JSON (강화된 파싱 with 정규식 추출)
-        if isinstance(data, str):
-            # ★★★ JSON 부분만 추출 (줄바꿈 이후 텍스트 제거)
-            s = data.strip()
-            
-            # 첫 번째 완전한 JSON 객체만 추출
-            brace_count = 0
-            json_end_idx = -1
-            for i, char in enumerate(s):
-                if char == '{':
-                    brace_count += 1
-                elif char == '}':
-                    brace_count -= 1
-                    if brace_count == 0:
-                        json_end_idx = i + 1
-                        break
-            
-            if json_end_idx > 0:
-                json_str = s[:json_end_idx]
-                logger.info(f"[PromptCache] 추출된 JSON 길이: {len(json_str)}")
-                logger.info(f"[PromptCache] 추출된 JSON: {json_str[:300]}...")
-            else:
-                json_str = s
-            
-            try:
-                parsed = json.loads(json_str)
-                logger.info(f"[PromptCache] json.loads 성공")
-            except Exception as e:
-                logger.warning(f"[PromptCache] json.loads 실패: {e}")
-                parsed = _loose_parse_json(json_str)
-                logger.info(f"[PromptCache] _loose_parse_json 결과 keys: {list(parsed.keys()) if isinstance(parsed, dict) else 'NOT_DICT'}")
-        else:
-            parsed = data
+        logger.info("[PromptCache] 원본 data 타입: %s", type(data).__name__)
+        parsed = _robust_action_input_to_dict(data) if not isinstance(data, dict) else data
 
         if not isinstance(parsed, dict):
             return {
@@ -831,7 +1013,9 @@ def _wrap_sim_compose_prompts(original_tool):
         logger.info(f"[PromptCache] scenario 존재: {'scenario' in inner}")
         logger.info(f"[PromptCache] victim_profile 존재: {'victim_profile' in inner}")
 
-        if not inner or (not inner.get("scenario") and not inner.get("victim_profile")):
+        # ✅ mcp.simulator_run 래퍼는 scenario + victim_profile을 캐시에서 꺼내 payload에 넣는다.
+        #    둘 중 하나라도 없으면 다음 단계에서 반드시 터진다. 여기서 강하게 막는다.
+        if (not isinstance(inner, dict)) or (not inner.get("scenario")) or (not inner.get("victim_profile")):
             # 디버깅 정보 강화
             logger.error(f"[PromptCache] 파싱 실패 - 원본 data 타입: {type(data)}")
             logger.error(f"[PromptCache] 파싱 실패 - parsed: {parsed}")
@@ -839,8 +1023,8 @@ def _wrap_sim_compose_prompts(original_tool):
             
             return {
                 "ok": False,
-                "error": "empty_input",
-                "message": "sim.compose_prompts에 scenario 또는 victim_profile이 없습니다.",
+                "error": "missing_required_fields",
+                "message": "sim.compose_prompts에는 scenario와 victim_profile이 모두 필요합니다.",
                 "parsed_keys": list(parsed.keys()),
                 "inner_keys": list(inner.keys()) if inner else [],
                 "debug_info": {
@@ -891,13 +1075,16 @@ def _wrap_sim_compose_prompts(original_tool):
             return {"ok": False, "error": "프롬프트가 비어있습니다"}
 
         # 8) 캐시 저장
-        prompt_id = f"prompts_round_{round_no}_{id(result)}"
+        # ✅ stream_id 스코프를 키에 포함 (동시 실행/다중 케이스에서 캐시 충돌/정리 오염 방지)
+        sid = _current_stream_id.get() or "no_stream"
+        prompt_id = f"{sid}:r{round_no}:{uuid.uuid4().hex}"
 
         _PROMPT_CACHE[prompt_id] = {
             "attacker_prompt": attacker_prompt,
             "victim_prompt": victim_prompt,
             "scenario": scenario,
             "victim_profile": victim_profile,
+            "stream_id": sid,
         }
 
         logger.info(f"[PromptCache] 저장 완료: {prompt_id} (round={round_no})")
@@ -930,14 +1117,7 @@ def _wrap_mcp_simulator_run(original_tool):
     def mcp_simulator_run_cached(data: Any) -> dict:
         """시뮬레이션 실행 (캐시된 프롬프트 사용)"""
 
-        # 1) 문자열 → JSON
-        if isinstance(data, str):
-            try:
-                parsed = json.loads(data)
-            except Exception:
-                parsed = _loose_parse_json(data)
-        else:
-            parsed = data
+        parsed = _robust_action_input_to_dict(data) if not isinstance(data, dict) else data
 
         if not isinstance(parsed, dict):
             return {
@@ -1036,16 +1216,17 @@ def _extract_prevention_from_last_observation(cap: ThoughtCapture) -> Dict[str, 
         return prev_dict.get("personalized_prevention", {})
     return {}
 
-def _validate_complete_execution(cap: ThoughtCapture, max_rounds: int) -> dict:
+def _validate_complete_execution(cap: ThoughtCapture, rounds_done: int) -> dict:
     """실행 완료 여부를 검증하고 누락된 단계를 반환"""
     tools_called = _extract_tool_call_sequence(cap)
     
     required = {
         "sim.fetch_entities": 1,
-        "sim.compose_prompts": max_rounds,
-        "mcp.simulator_run": max_rounds,
-        "admin.make_judgement": max_rounds,
-        "admin.generate_guidance": max(0, max_rounds - 1),
+        # ✅ 조기 종료(critical) 또는 max_rounds 미만 수행을 고려: "실제로 끝난 라운드 수" 기준
+        "sim.compose_prompts": rounds_done,
+        "mcp.simulator_run": rounds_done,
+        "admin.make_judgement": rounds_done,
+        "admin.generate_guidance": max(0, rounds_done - 1),
         "admin.make_prevention": 1,
         "admin.save_prevention": 1,
     }
@@ -1139,11 +1320,14 @@ def build_agent_and_tools(db: Session, use_tavily: bool) -> Tuple[AgentExecutor,
     logger.info("[AgentLLM] model=%s", getattr(llm, "model_name", "unknown"))
 
     tools: List = []
-    # ★★★ sim.compose_prompts 래핑
+    # ★★★ sim 도구 래핑: 문자열 Action Input을 먼저 dict로 복구해서 invoke
     raw_sim_tools = make_sim_tools(db)
     for tool in raw_sim_tools:
         if tool.name == "sim.compose_prompts":
             tools.append(_wrap_sim_compose_prompts(tool))
+        elif tool.name in ("sim.fetch_entities",):
+            # sim.fetch_entities도 {"data": {...}} 스타일인 경우가 많아서 강제 래핑
+            tools.append(_wrap_tool_force_json_input(tool, require_data_wrapper=True))
         else:
             tools.append(tool)
 
@@ -1158,7 +1342,14 @@ def build_agent_and_tools(db: Session, use_tavily: bool) -> Tuple[AgentExecutor,
         else:
             tools.append(tool)
 
-    tools += make_admin_tools(db, GuidelineRepoDB(db))
+    # ★★★ admin 도구 래핑: Action Input 문자열 파싱 실패(특히 마지막 '}' 누락)를 orchestrator에서 크게 줄임
+    raw_admin_tools = make_admin_tools(db, GuidelineRepoDB(db))
+    for tool in raw_admin_tools:
+        if tool.name.startswith("admin."):
+            # admin.*는 모두 SingleData 스타일({"data": {...}})로 강제
+            tools.append(_wrap_tool_force_json_input(tool, require_data_wrapper=True))
+        else:
+            tools.append(tool)
     if use_tavily:
         tools += make_tavily_tools()
 
@@ -1207,14 +1398,18 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
     _ACTIVE_RUN_KEYS.add(run_key)
 
     token = _current_stream_id.set(stream_id)
-    _attach_global_sse_logging_handlers()
-    _ensure_console_stream_handler()
-    _patch_print()
-
-    tee_out = TeeTerminal(stream_id, "stdout")
-    tee_err = TeeTerminal(stream_id, "stderr")
-
-    _emit_to_stream("run_start", {"stream_id": stream_id, "payload_hint": _truncate(payload, 400)})
+    # ✅ CLI/배치에서는 SSE를 끈다 (running loop 문제 방지)
+    sse_on = _sse_enabled(payload)
+    if sse_on:
+        _attach_global_sse_logging_handlers()
+        _ensure_console_stream_handler()
+        _patch_print()
+        tee_out = TeeTerminal(stream_id, "stdout")
+        tee_err = TeeTerminal(stream_id, "stderr")
+        _emit_to_stream("run_start", {"stream_id": stream_id, "payload_hint": _truncate(payload, 400)})
+    else:
+        tee_out = None
+        tee_err = None
 
     req = None
     ex = None
@@ -1225,7 +1420,13 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
         if _stop and _stop.is_set():
             return {"status": "cancelled"}
             
-        with contextlib.redirect_stdout(tee_out), contextlib.redirect_stderr(tee_err):
+        if sse_on:
+            ctx = contextlib.ExitStack()
+            ctx.enter_context(contextlib.redirect_stdout(tee_out))
+            ctx.enter_context(contextlib.redirect_stderr(tee_err))
+        else:
+            ctx = contextlib.nullcontext()
+        with ctx:
             req = SimulationStartRequest(**payload)
             ex, mcp_manager = build_agent_and_tools(db, use_tavily=req.use_tavily)
 
@@ -1558,8 +1759,31 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
             logger.info(f"[CaseMission] case_id 확정: {case_id}")
 
             # 3. 완료된 라운드 수 계산
-            judgement_count = sum(1 for tool in actual_tools if tool == "admin.make_judgement")
-            rounds_done = judgement_count
+            # ❗ 기존: action 기준 카운트 → retry/중복 호출 시 라운드 수 부풀려짐
+            # ✅ 수정: observation 기반으로 run_no를 최대한 신뢰하고 dedupe
+            rounds_done = 0
+            try:
+                seen = set()
+                for ev in cap.events:
+                    if ev.get("type") != "observation" or ev.get("tool") != "admin.make_judgement":
+                        continue
+                    j = _loose_parse_json(ev.get("output"))
+                    if not isinstance(j, dict):
+                        continue
+                    # admin.make_judgement 출력에 run_no/run이 있으면 그걸 사용
+                    rno = j.get("run_no", j.get("run"))
+                    if isinstance(rno, int):
+                        seen.add(rno)
+                    else:
+                        # run_no가 없으면 "내용 기반"으로 중복 제거(최소 안전장치)
+                        seen.add(json.dumps(_truncate(j, 2000), ensure_ascii=False, sort_keys=True))
+                rounds_done = len(seen)
+            except Exception:
+                rounds_done = 0
+
+            # fallback: 그래도 0이면 기존 방식(최후의 보루)
+            if rounds_done <= 0:
+                rounds_done = sum(1 for tool in actual_tools if tool == "admin.make_judgement")
             logger.info(f"[CaseMission] 완료된 라운드: {rounds_done}")
 
             # 4. 각 라운드 판정 및 turns 추출
@@ -1576,6 +1800,7 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
             judgement_idx = 0
             guidance_idx = 0
             sim_run_idx = 0
+            seen_judgement_run_nos: Set[int] = set()
 
             logger.info(f"[DEBUG] ===== cap.events 전체 ({len(cap.events)}개) =====")
             for i, ev in enumerate(cap.events):
@@ -1588,11 +1813,20 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
                     logger.info(f"[DEBUG] Observation detected: tool={tool_name}, output_len={len(str(output))}")
                     # admin.make_judgement
                     if tool_name == "admin.make_judgement":
-                        judgement_idx += 1
                         judgement = _loose_parse_json(output)
                         if judgement:
+                            # ✅ 가능한 경우, 실제 run_no를 따르고 중복을 제거
+                            rno = judgement.get("run_no", judgement.get("run"))
+                            if isinstance(rno, int):
+                                if rno in seen_judgement_run_nos:
+                                    continue
+                                seen_judgement_run_nos.add(rno)
+                                use_run_no = rno
+                            else:
+                                judgement_idx += 1
+                                use_run_no = judgement_idx
                             judgements_history.append({
-                                "run_no": judgement_idx,
+                                "run_no": use_run_no,
                                 "phishing": judgement.get("phishing", False),
                                 "risk": judgement.get("risk", {}),
                                 "evidence": judgement.get("evidence", "")
@@ -1843,7 +2077,7 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
             logger.info(f"[CaseMission] 종료 사유: {finished_reason}")
 
             # 6. 실행 완료 검증
-            validation = _validate_complete_execution(cap, max_rounds)
+            validation = _validate_complete_execution(cap, rounds_done)
             if not validation["is_complete"]:
                 logger.warning(
                     f"[Validation] 누락된 단계: {validation['missing_steps']}\n"
@@ -2049,13 +2283,14 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
 
     finally:
         with contextlib.suppress(Exception):
-            case_id = locals().get("case_id")
-            if case_id:
-                # 이 케이스 관련 프롬프트 캐시만 정리
-                keys_to_remove = [k for k in _PROMPT_CACHE.keys() if case_id in k or "round_" in k]
-                for k in keys_to_remove:
-                    _PROMPT_CACHE.pop(k, None)
-                logger.info(f"[PromptCache] 정리: {len(keys_to_remove)}개 항목 제거")
+            # ✅ 기존: "round_" 포함이면 전부 삭제 → 다른 케이스/동시 실행 캐시까지 싹 지워짐
+            # ✅ 수정: stream_id 스코프(prefix)로만 제거
+            sid = stream_id
+            keys_to_remove = [k for k, v in _PROMPT_CACHE.items() if str(k).startswith(f"{sid}:")]
+            for k in keys_to_remove:
+                _PROMPT_CACHE.pop(k, None)
+            if keys_to_remove:
+                logger.info("[PromptCache] 정리: stream_id=%s removed=%s", sid, len(keys_to_remove))
 
                 # 🔊 TTS용 대화 캐시도 함께 정리
                 try:
@@ -2064,16 +2299,18 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
                     logger.warning("[TTS_CACHE] clear_case_dialog_cache 실패: case_id=%s error=%s", case_id, e)
         with contextlib.suppress(Exception):
             _ACTIVE_RUN_KEYS.discard(run_key)
-        with contextlib.suppress(Exception):
-            tee_out.flush()
-            tee_err.flush()
+        if sse_on:
+            with contextlib.suppress(Exception):
+                tee_out.flush()
+                tee_err.flush()
         with contextlib.suppress(Exception):
             _unpatch_print()
         with contextlib.suppress(Exception):
             _current_stream_id.reset(token)
-        with contextlib.suppress(Exception):
-            logger.removeHandler(_sse_log_handler)
-        _detach_global_sse_logging_handlers()
+        if sse_on:
+            with contextlib.suppress(Exception):
+                logger.removeHandler(_sse_log_handler)
+            _detach_global_sse_logging_handlers()
         with contextlib.suppress(Exception):
             if locals().get("mcp_manager") and getattr(mcp_manager, "is_running", False):
                 mcp_manager.stop_mcp_server()

@@ -17,7 +17,7 @@ from app.services.agent.orchestrator_react import run_orchestrated, _ensure_stre
 # =========================
 # ✅ 여기만 수정하면 됨
 # =========================
-OFFENDER_ID = 1          # 피싱범 id
+OFFENDER_ID = 4          # 피싱범 id
 VICTIM_ID = 1            # 피해자 id
 
 MAX_TURNS = 15           # 한 라운드 최대 턴 수 (피싱범+피해자 교환 포함 구조면 orchestrator 기준에 맞춰 유지)
