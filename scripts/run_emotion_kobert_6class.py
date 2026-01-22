@@ -28,7 +28,7 @@ os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
 # 🔧 여기만 수정하면 됨
 # =========================
 INPUT_PATH = r"C:\LIT_VP2\VP\scripts\datasets"   # 파일(.jsonl) 또는 폴더
-OUTPUT_DIR = r"C:\LIT_VP2\VP\scripts\emotion_result"   # 출력 폴더
+OUTPUT_DIR = r"C:\LIT_VP2\VP\scripts\emotion_result_kobert"   # 출력 폴더
 
 # ✅ 스위치: 원하는 것만 True로 켜기
 RUN_OFFENDER_PAIR = True     # victim_offender_pair_*.jsonl 처리
