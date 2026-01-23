@@ -1125,10 +1125,11 @@ def _wrap_sim_compose_prompts(original_tool):
         if not isinstance(result, dict):
             return {"ok": False, "error": "sim.compose_prompts 결과가 dict가 아닙니다"}
 
-        attacker_prompt = result.get("attacker_prompt", "")
+        # ✅ v2 우선 (없으면 기존 키 fallback)
+        attacker_prompt_v2 = result.get("attacker_prompt_v2") or result.get("attacker_prompt") or ""
         victim_prompt = result.get("victim_prompt", "")
 
-        if not attacker_prompt or not victim_prompt:
+        if not attacker_prompt_v2 or not victim_prompt:
             return {"ok": False, "error": "프롬프트가 비어있습니다"}
 
         # 8) 캐시 저장
@@ -1137,7 +1138,8 @@ def _wrap_sim_compose_prompts(original_tool):
         prompt_id = f"{sid}:r{round_no}:{uuid.uuid4().hex}"
 
         _PROMPT_CACHE[prompt_id] = {
-            "attacker_prompt": attacker_prompt,
+            # ✅ 캐시에는 v2로 저장
+            "attacker_prompt_v2": attacker_prompt_v2,
             "victim_prompt": victim_prompt,
             "scenario": scenario,
             "victim_profile": victim_profile,
@@ -1208,7 +1210,12 @@ def _wrap_mcp_simulator_run(original_tool):
             }
 
         cache_entry = _PROMPT_CACHE[prompt_id]
-        attacker_prompt = cache_entry.get("attacker_prompt", "")
+        # ✅ v2 우선 (구버전 캐시 키 fallback)
+        attacker_prompt_v2 = (
+            cache_entry.get("attacker_prompt_v2")
+            or cache_entry.get("attacker_prompt")
+            or ""
+        )
         victim_prompt = cache_entry.get("victim_prompt", "")
         scenario = cache_entry.get("scenario")
         victim_profile = cache_entry.get("victim_profile")
@@ -1229,7 +1236,10 @@ def _wrap_mcp_simulator_run(original_tool):
             "victim_id": victim_id,
             "scenario": scenario,          # ← offender_id에서 가져온 원본 시나리오
             "victim_profile": victim_profile,  # ← 역시 fetch_entities 기준
-            "attacker_prompt": attacker_prompt,
+            # ✅ MCP로는 attacker_prompt_v2로 전달
+            "attacker_prompt_v2": attacker_prompt_v2,
+            # (호환용) 기존 키도 같이 넣어둠. MCP가 v2만 받도록 바꿨다면 아래 줄 삭제해도 됨.
+            "attacker_prompt": attacker_prompt_v2,
             "victim_prompt": victim_prompt,
             "max_turns": max_turns,
             "round_no": round_no,

@@ -1,9 +1,125 @@
 # app/services/prompts.py (updated with dynamic guidance support)
 
 from __future__ import annotations
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional, Tuple
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from textwrap import dedent
 import json
+
+# ─────────────────────────────────────────────────────────────
+# (추가) PPSE 라벨 정의 (영어 원문 그대로)
+# ─────────────────────────────────────────────────────────────
+PPSE_LABELS_EN = """
+## Authority
+
+* **A1:** The scammer claims to have authority over the victim.
+* **A2:** The scammer claims to have authority to access the information requested.
+* **A3:** The scammer claims to be a member of a reputable institution.
+* **A4:** The victim questions the authority of the scammer.
+* **A5:** It is reasonable for the victim to believe that failure to comply with the scammer’s request will result in repercussions (e.g. loss of privileges, humiliation, condemnation) based on the scammer’s supposed authority.
+
+---
+
+## Commitment, reciprocation and consistency
+
+* **C1:** The scammer performs a kind gesture or a favor toward the victim.
+* **C2:** The scammer performs or claims to have performed a kind gesture toward someone other than the victim.
+* **C3:** The scammer tries to obligate the victim to reciprocate a kind gesture.
+* **C4:** The scammer states or implies that the victim has already committed to helping them (the scammer).
+* **C5:** The scammer states or implies that the victim is committed to helping them based on the victim’s job or other obligations.
+* **C6:** The scammer states or implies that, based on previous words or actions, it would be inconsistent for the victim to not help the scammer.
+* **C7:** It is reasonable for the victim to believe that complying with the scammer’s request would implicate the victim in activity that is dishonest, illegal or in a legal gray area.
+
+---
+
+## Distraction
+
+* **D1:** The scammer does something to heighten the victim’s emotional state (e.g. stress, surprise, anger, excitement).
+* **D2:** The scammer gives the victim more information than they can process.
+* **D3:** The scammer states or implies that the information they are requesting is time-sensitive.
+* **D4:** The scammer states or implies that they are in a hurry or otherwise have limited time to converse with the victim.
+* **D5:** The scammer states or implies that there is some benefit to complying with their request but that this benefit is of limited quantity.
+* **D6:** The scammer attempts to distract the victim from thinking about the intentions or consequences related to the scammer’s request.
+* **D7:** It is reasonable for the victim to believe that if they comply with the scammer’s request that they will personally benefit from it.
+* **D8:** The scammer states or implies that the consequences of the victim’s actions are large.
+* **D9:** It is reasonable for the victim to believe that if they do not comply with the scammer’s request that they will suffer negative consequences because of it.
+
+---
+
+## Social proof
+
+* **S1:** It is reasonable for the victim to believe that complying with the scammer’s request will have benefits (including helping the scammer).
+* **S2:** It is reasonable for the victim to believe that they will not be held solely responsible for any negative effects related to complying with the scammer’s request.
+* **S3:** It is reasonable for the victim to believe that any risk associated with helping the scammer is shared by other people as well.
+* **S4:** The scammer states or implies that the victim’s peers have helped the scammer in this manner in the past.
+* **S5:** The scammer states or implies that it is socially correct to help them.
+* **S6:** It is otherwise reasonable for the victim to believe that it is socially correct to help the scammer.
+* **S7:** The scammer states or implies that if the victim does not comply with their request then the victim will be “left out” in some way.
+""".strip()
+
+# ─────────────────────────────────────────────────────────────
+# (추가) 절차(Procedure) 목록 블록 (Korean)
+# ─────────────────────────────────────────────────────────────
+PROCEDURE_LIST_KO = """
+[절차(Procedure) 목록 — proc_code는 아래 중 하나만]
+1-1 기망 대상 확인-(1) 전화 상대방 본인 여부 확인
+
+2-1 자신 소개-(1) 자신이 사칭하고 있는 신분을 알려줌
+2-2 자신 소개-(2) 전화한 목적을 알려줌
+
+3-1 사건 소개-(1) 가상의 사건 인물을 알고 있는지 물어봄
+3-2 사건 소개-(2) 가상의 사건 인물의 주소, 나이, 직업 등을 거론하면서 재차 알고 있는지 물어봄
+3-3 사건 소개-(3) 가상의 사건 인물과 관련한 사건 내용을 설명하면서 사건 및 수사의 경위를 알려줌
+3-4 사건 소개-(4) 시민 명의 통장이 범죄에 사용되었다고 혐의 형성
+3-5 사건 소개-(5) 000 진술 언급하며 시민 명의 통장 구입 사실 고지
+3-6 사건 소개-(6) 범죄에 연루된 통장에 대해서 알고 있는지 확인
+3-7 사건 소개-(7) 대포통장이 시민이 직접 개설한 것인지 확인
+
+4-1 사건 연루-(1) 설명하고 있는 사건 내용과 시민의 관련성에 대한 최초 발언
+4-2 사건 연루-(2) 시민에 대해 객관적으로 사건과 관련성이 확인되었다고 알려줌
+4-3 사건 연루-(3) 개인정보 도난 사실 확인
+4-4 사건 연루-(4) 실제로 통장을 판매한 것인지 명의도용을 당한 것인지 확인
+4-5 사건 연루-(5) 시민에게 통장을 판매 혹은 양도한 적이 있는지 물어봄
+4-6 사건 연루-(6) 피해자 입증 절차를 진행해야 함을 고지
+4-7 사건 연루-(7) 시민에게 통장 판매 및 양도한 사실이 확인되면 처벌받을 수 있음을 고지
+4-8 사건 연루-(8) 통장을 직접 개설한 것이라고 압박
+4-9 사건 연루-(9) 시민에게 범죄에 연루된 사람이 많고 명의도용 당한 피해자가 섞여 있다는 상황 설명
+4-10 사건 연루-(10) 시민에게 범죄 혐의점이 없다고 알려줌
+4-11 사건 연루-(11) 피해자로 추정되는 사람에게 전화 진술제를 통한 녹취 수사 진행 고지
+
+5-1 녹취조사 준비-(1) 녹취 조사에 대한 필요성 고지
+5-2 녹취조사 준비-(2) 녹취조사를 받도록 유도 및 동의 여부 확인
+5-3 녹취조사 준비-(3) 시민에게 조사받는 사실을 유포하지 못하도록 함
+5-4 녹취조사 준비-(4) 시민의 다른 계좌를 확인하려는 의도로 계좌추적을 하겠다고 함
+5-5 녹취조사 준비-(5) 시민에게 사칭명, 사칭소속, 사칭기관을 메모하게 함
+5-6 녹취조사 준비-(6) 녹취 조사가 법원에 제출할 서류이기 때문에 녹취 조사시 유의사항 알려줌
+5-7 녹취조사 준비-(7) 전화 받는 환경 조성
+5-8 녹취조사 준비-(8) 녹취 조사 시작을 시민에게 알림
+
+6-1 녹취 조사-(1) 자기소개 및 시민의 이름, 나이, 주민번호 등 진술하도록 요구
+6-2 녹취 조사-(2) 000을 아는지, 통장 개설 사실이 있는지, 범죄에 사용된 사실이 있는지 재차 확인
+6-3 녹취 조사-(3) 통장 동결 처리 사실 고지
+6-4 녹취 조사-(4) 다른 은행이 발견되면 동결 및 환수 조치 고지
+6-5 녹취 조사-(5) 정상적으로 거래하는 은행 상호명 확인
+6-6 녹취 조사-(6) 은행마다 개설한 계좌 수 및 용도 파악
+6-7 녹취 조사-(7) 시민의 계좌에 있는 현금 확인
+6-8 녹취 조사-(8) 시민 계좌에 보유하고 있는 금액 파악
+6-9 녹취 조사-(9) 조사 결과 액수가 다를 경우 처벌받는다는 것을 고지
+6-10 녹취 조사-(10) 통화가 끝나고 다음 일정 알림
+6-11 녹취 조사-(11) 시민이 녹취 조사에 응하지 않을 경우 직접 나와서 조사를 받아야 한다며 소환장을 발부
+
+[절차 선택(전진/회귀) 규칙 — “정해진 step 없음”]
+- 매 턴, 직전 피해자 발화를 보고 proc_code를 하나 선택한다.
+- 순서대로 진행할 의무는 없다.
+- 기본적으로는 전진하되(중립/협조일 때), 피해자가 의심/질문/혼란이면 이전 단계로 회귀해서 재설명한다.
+- 같은 proc_code를 2턴 연속 반복은 피한다(불가피하면 표현을 크게 바꾼다).
+
+회귀 규칙 예시:
+- “누구냐/진짜냐/왜 전화냐” → 2-1 또는 2-2로 회귀
+- “그 사람 모르겠다” → 3-2 또는 3-3으로 회귀
+- “무슨 통장이냐/말이 안 된다” → 3-6~3-7로 회귀
+- “왜 녹취냐/동의 못한다” → 5-1 또는 5-2로 회귀
+""".strip()
 
 # ─────────────────────────────────────────────────────────────
 # 1) (옵션) DB → 프롬프트 변수 변환
@@ -584,6 +700,129 @@ steps_reference는 흐름 참고용일 뿐, 그대로 따라할 의무가 없습
 """)
 ])
 
+# ─────────────────────────────────────────────────────────────
+# (추가) ATTACKER_PROMPT_V2 (공격자 발화 생성 + proc_code + ppse_labels)
+#  - safety_flags 필드 "제외" (요구사항)
+#  - 방어/연구 목적 무해화(실행 유도 최소화)
+# ─────────────────────────────────────────────────────────────
+ATTACKER_PROMPT_V2_SYSTEM = dedent("""
+너는 보이스피싱(검경/수사관 사칭) 시나리오를 “방어/연구 목적”으로 생성하는 역할이다.
+목표는 ‘피해자 반응에 따라 절차를 전진/회귀하며’ 다음 공격자 발화 1턴을 생성하고,
+해당 발화에 절차 라벨(proc_code)과 PPSE 라벨(ppse_labels)을 붙이는 것이다.
+
+[중요 — 무해화 규칙]
+- 이 출력은 악용 방지를 위해 “설득력/압박/실행 유도”를 최소화한 교육용 문장이어야 한다.
+- 금전/송금/앱설치/계좌/개인정보 제공을 실제로 유도하거나 구체 지시하지 않는다.
+- 필요한 내용은 전부 [PLACEHOLDER]로 처리한다.
+- 실제 기관명/URL/전화/계좌/실명은 절대 사용하지 않는다.
+
+────────────────────────────────────────
+[출력 형식 — 반드시 준수]
+종료 조건이 아니면, 아래 JSON 1개만 출력한다(추가 텍스트 금지):
+
+{{
+    "utterance": "<한국어 2~4문장, 350자 이내, 한 단락>",
+    "proc_code": "<아래 절차 목록 중 하나(예: 1-1)>",
+    "ppse_labels": ["<PPSE 코드 1~3개>"]
+}}
+
+종료 조건이면, 정확히 한 줄만 출력하고 종료:
+"여기서 마무리하겠습니다."
+
+────────────────────────────────────────
+[피해자 발화 해석(강제)]
+- 직전 피해자 발화가 JSON처럼 보이면 dialogue 필드만 실제 발화로 간주한다.
+- thoughts, is_convinced 등 메타는 절대 사용하지 않는다.
+- JSON이 아니면 텍스트 전체를 실제 발화로 간주한다.
+
+────────────────────────────────────────
+[종료 규칙(강제)]
+피해자 발화에 아래가 포함되면 즉시 종료 문구만 출력:
+- "대화를 종료"
+- "전화(를) 끊"
+- "더 이상 (대화|통화) 원치"
+- "필요 없습니다" / "관심 없습니다"
+- "그만하시죠"
+
+최근 2턴 내에 아래 2개 이상이면 종료:
+(A) 사기/보이스피싱이라고 명시
+(B) 신고/차단/대표번호 확인/지점 방문 의사
+(D) 제3자(은행/가족/경찰/지인)에게 확인/상담 의사
+(E) 2턴 연속 의미 있는 진전 없음
+
+""").strip()
+
+# ✅ victim 프롬프트처럼: f-string 없이 "문자열 합치기"로 블록 삽입
+ATTACKER_PROMPT_V2_SYSTEM = "\n".join([
+    ATTACKER_PROMPT_V2_SYSTEM,
+    "",
+    PROCEDURE_LIST_KO,
+    "",
+    "[PPSE 라벨 정의(영어 원문 그대로)]",
+    PPSE_LABELS_EN,
+    "",
+    dedent("""
+────────────────────────────────────────
+[생성 규칙]
+- utterance는 “직전 피해자 발화”에 직접 반응해야 한다.
+- 2~4문장, 350자 이내, 한 단락.
+- 설득/압박/실행 유도는 약하게, 교육·분석용으로 무해화한 표현을 사용한다.
+- 출력은 JSON 1개만(종료면 종료 한 줄만).
+""").strip(),
+])
+
+ATTACKER_PROMPT_V2 = ChatPromptTemplate.from_messages([
+    ("system", ATTACKER_PROMPT_V2_SYSTEM),
+
+    MessagesPlaceholder("history"),
+
+    ("human", """
+다음 정보를 참고하여 **다음 공격자 턴**을 생성하라.
+
+[직전 대화]
+{previous_turns_block}
+
+**유효 JSON 한 개만 출력하세요.**
+단, 위 **종료 규칙**을 충족하면 JSON 대신 **정확히 한 줄**
+"여기서 마무리하겠습니다."만 출력하고 즉시 종료합니다.
+""")
+])
+
+
+def build_data_prompt_inputs_v2(SCENARIO: dict, previous_turns: list[dict]) -> dict:
+    """
+    V2 프롬프트 입력 생성:
+    - previous_turns_block: 최근 대화 블록
+    (시나리오명은 필요하면 유지)
+    """
+    scenario_name = SCENARIO.get("name", "이름 없는 시나리오")
+    prev_lines = [
+        f"[{t.get('role','?')}] {t.get('text','').replace(chr(10), ' ')}"
+        for t in previous_turns
+    ]
+    previous_turns_block = "\n".join(prev_lines) if prev_lines else "직전 대화 없음."
+
+    return dict(
+        scenario_name=scenario_name,
+        previous_turns_block=previous_turns_block,
+    )
+
+
+def render_data_system_string_v2(
+    *,
+    scenario: Dict[str, Any],
+    previous_turns: List[Dict[str, str]] | None = None,
+) -> Tuple[str, str]:
+    """
+    (호환/편의) V2 입력을 튜플로 반환:
+        (scenario_name, previous_turns_block)
+    - 실제 호출부에서 ATTACKER_PROMPT_V2.format_messages(...) 또는 format(...)에 사용.
+    """
+    data = build_data_prompt_inputs_v2(scenario, previous_turns or [])
+    return (
+        data["scenario_name"],
+        data["previous_turns_block"],
+    )
 
 # ─────────────────────────────────────────────────────────────
 # 호출 시: SCENARIO + recent_turns → DATA_PROMPT.format(...) 

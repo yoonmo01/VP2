@@ -62,6 +62,21 @@ def _try_parse_victim_json(text: str) -> Tuple[Optional[str], Optional[str]]:
     except Exception:
         return None, None
 
+def _try_parse_victim_payload(text: str) -> Optional[Dict[str, Any]]:
+    """
+    victim turn의 text가 {"dialogue": "...", "thoughts":"...", "is_convinced": ...} 형태인 케이스 지원.
+    """
+    if not text:
+        return None
+    s = _normalize_quotes(_strip_code_fences(text)).strip()
+    if not s.startswith("{"):
+        return None
+    try:
+        obj = json.loads(s)
+        return obj if isinstance(obj, dict) else None
+    except Exception:
+        return None
+
 def _get_text(turn: Dict[str, Any]) -> str:
     return str(turn.get("text") or turn.get("content") or "").strip()
 
@@ -92,6 +107,117 @@ def _get_thoughts(turn: Dict[str, Any]) -> Optional[str]:
     s = str(v).strip()
     return s or None
 
+def _get_is_convinced(turn: Dict[str, Any]) -> Optional[int]:
+    """
+    is_convinced를 turn dict 또는 victim JSON(text)에서 추출.
+    """
+    v = turn.get("is_convinced")
+    if isinstance(v, (int, float)):
+        return int(v)
+    # victim text(JSON 문자열)에서 파싱
+    if _is_victim(turn):
+        payload = _try_parse_victim_payload(_get_text(turn))
+        if payload is not None:
+            vv = payload.get("is_convinced")
+            if isinstance(vv, (int, float)):
+                return int(vv)
+            # 문자열 숫자도 방어
+            if isinstance(vv, str) and vv.strip().lstrip("-").isdigit():
+                try:
+                    return int(vv.strip())
+                except Exception:
+                    return None
+    return None
+
+def _contains_any(s: str, keywords: List[str]) -> bool:
+    ss = (s or "").strip()
+    if not ss:
+        return False
+    return any(k in ss for k in keywords)
+
+def _override_pred4_if_needed(
+    *,
+    pred4: str,
+    probs4: Optional[List[float]],
+    victim_text: str,
+    is_convinced: Optional[int],
+) -> Tuple[str, Optional[List[float]], Optional[Dict[str, Any]]]:
+    """
+    ✅ F 과편향 완화용 후처리:
+    - 거절/종료(단절) 표현이 강한데 pred4가 F로 나오는 경우
+      -> A(단호/저항) 또는 N(종료)로 override
+    - is_convinced가 낮을수록(<=1) override를 더 적극 적용
+    """
+    p4 = (pred4 or "").strip().upper()
+    if p4 != "F":
+        return pred4, probs4, None
+
+    txt = (victim_text or "").strip()
+    if not txt:
+        return pred4, probs4, None
+
+    # 🔥 종료/차단 신호(강함) → N
+    termination_kw = [
+        "대화를 종료", "통화를 종료", "전화 끊", "끊겠습니다", "끊을게요", "끊어요",
+        "그만하겠습니다", "그만할게요", "더 이상 대화", "더 이상 통화", "연락하지 마",
+        "신고하겠습니다", "신고할게요",
+    ]
+    # 🔥 거절/개인정보 차단(강함) → A
+    refusal_kw = [
+        "개인정보", "정보를 드릴", "드릴 수 없", "줄 수 없", "못 드", "못 줍",
+        "거절", "정식 절차", "공식 절차", "절차를 밟", "수상", "보이스피싱", "사기",
+        "증빙", "공문", "문서", "확인해", "확인 후",
+    ]
+
+    is_low = (is_convinced is None) or (is_convinced <= 1)
+    if not is_low:
+        # convinced가 높은데 fear면(순응 가능성) override하지 않음
+        return pred4, probs4, None
+
+    override_to: Optional[str] = None
+    reason: Optional[str] = None
+    if _contains_any(txt, termination_kw):
+        override_to = "N"
+        reason = "termination_or_block_signal"
+    elif _contains_any(txt, refusal_kw):
+        override_to = "A"
+        reason = "strong_refusal_signal"
+
+    if not override_to:
+        return pred4, probs4, None
+
+    # probs4는 [N, F, A, E] 순서를 가정
+    new_probs = None
+    if isinstance(probs4, list) and len(probs4) == 4:
+        try:
+            n, f, a, e = [float(x) for x in probs4]
+            if override_to == "A":
+                # fear mass를 anger로 이동(최소 a가 f 이상 되도록)
+                moved = max(0.0, f - a)
+                a = a + moved
+                f = f - moved
+            elif override_to == "N":
+                # fear mass를 neutral로 이동(최소 n이 f 이상 되도록)
+                moved = max(0.0, f - n)
+                n = n + moved
+                f = f - moved
+            # 정규화
+            s = n + f + a + e
+            if s > 0:
+                new_probs = [n / s, f / s, a / s, e / s]
+            else:
+                new_probs = probs4
+        except Exception:
+            new_probs = probs4
+
+    override_meta = {
+        "from": pred4,
+        "to": override_to,
+        "reason": reason,
+        "is_convinced": is_convinced,
+        "matched_text": txt[:120],
+    }
+    return override_to, (new_probs if new_probs is not None else probs4), override_meta
 
 def _get_prev_offender_text(out_turns: List[Dict[str, Any]], i: int) -> Optional[str]:
     for j in range(i - 1, -1, -1):
@@ -223,17 +349,32 @@ def label_emotions_on_turns(
         if pred.get("_skip"):
             continue
 
+        # ✅ 후처리(override)용 정보
+        victim_text_for_rule = _get_dialogue_for_emotion(out_turns[idx])
+        victim_is_convinced = _get_is_convinced(out_turns[idx])
+
+        # ✅ F 과편향 완화: 거절/종료 케이스면 pred4를 A/N으로 교정
+        adj_pred4, adj_probs4, override_meta = _override_pred4_if_needed(
+            pred4=pred.get("pred4"),
+            probs4=pred.get("probs4"),
+            victim_text=victim_text_for_rule,
+            is_convinced=victim_is_convinced,
+        )
+
         emotion_obj = {
-            "pred4": pred["pred4"],
-            "probs4": pred["probs4"],
+            "pred4": adj_pred4,
+            "probs4": adj_probs4 if adj_probs4 is not None else pred.get("probs4"),
             "pred8": pred["pred8"],
             "probs8": pred.get("probs8"),
             "surprise_to": pred.get("surprise_to"),
             "cue_scores": pred.get("cue_scores"),
             "p_surprise": pred.get("p_surprise"),
         }
+        if override_meta:
+            emotion_obj["override"] = override_meta
         out_turns[idx]["emotion"] = emotion_obj
-        victim_emotion_seq.append(pred["pred4"])
+        # ✅ HMM 입력도 교정된 pred4로 사용해야 v3 과대상승을 막을 수 있음
+        victim_emotion_seq.append(adj_pred4)
         labeled_victim_indices.append(idx)
 
     # 4) (옵션) HMM 실행 후 결과 주입

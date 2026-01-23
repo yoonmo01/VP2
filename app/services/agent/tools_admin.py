@@ -398,6 +398,9 @@ class _JudgeMakeInput(BaseModel):
     # 오케스트레이터가 바로 턴을 넘겨줄 수 있게 허용
     turns: Optional[List[Dict[str, Any]]] = None
     log: Optional[Dict[str, Any]] = None
+    # ✅ 추가: 오케스트레이터가 계산한 HMM 결과를 같이 넘길 수 있게
+    hmm: Optional[Dict[str, Any]] = None
+    hmm_result: Optional[Dict[str, Any]] = None
 
 
 class _GuidanceInput(BaseModel):
@@ -807,6 +810,16 @@ def make_admin_tools(db: Session, guideline_repo):
                 turns = maybe
         if turns is None:
             turns = _fetch_turns_from_mcp(ji.case_id, ji.run_no)
+        # ✅ HMM 결과 추출 (payload 우선, log에 있으면 fallback)
+        hmm_payload: Optional[Dict[str, Any]] = None
+        if isinstance(ji.hmm, dict):
+            hmm_payload = ji.hmm
+        elif isinstance(ji.hmm_result, dict):
+            hmm_payload = ji.hmm_result
+        elif ji.log and isinstance(ji.log, dict):
+            maybe_hmm = ji.log.get("hmm") or ji.log.get("hmm_result")
+            if isinstance(maybe_hmm, dict):
+                hmm_payload = maybe_hmm
 
         # summarize_run_full이 기대하는 최소 필드(role/text)로 정규화
         normalized_turns: List[Dict[str, Any]] = []
@@ -824,7 +837,15 @@ def make_admin_tools(db: Session, guideline_repo):
                 normalized_turns.append(t)
                 continue
             normalized_turns.append({**t, "role": str(role), "text": str(text)})
-
+        # ✅ 핵심: HMM을 summarize_run_full로 “확실히” 전달
+        # - summarize_run_full이 turns만 받는 구조라면,
+        #   system 턴을 하나 추가해 hmm JSON을 넣어 전달하는 게 가장 안전함.
+        if hmm_payload:
+            normalized_turns.append({
+                "role": "system",
+                "text": "[HMM_RESULT] 아래 meta.hmm에 HMM 결과가 포함됨",
+                "meta": {"hmm": hmm_payload}
+            })
         try:
             verdict = summarize_run_full(turns=normalized_turns)
         except TypeError as te:
@@ -833,6 +854,12 @@ def make_admin_tools(db: Session, guideline_repo):
                 status_code=500,
                 detail="summarize_run_full이 'turns' 인자를 지원하도록 업데이트해 주세요."
             ) from te
+
+        # ✅ verdict에도 hmm을 같이 실어두면 이후 generate_guidance/저장에서도 사용 가능
+        if hmm_payload and isinstance(verdict, dict):
+            verdict.setdefault("signals", {})
+            if isinstance(verdict["signals"], dict):
+                verdict["signals"].setdefault("hmm", hmm_payload)
 
         risk = verdict.get("risk") or {}
         score = int(risk.get("score", 0) or 0)

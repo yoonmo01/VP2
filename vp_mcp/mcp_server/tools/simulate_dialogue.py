@@ -7,6 +7,7 @@ from ..db.models import Conversation, TurnLog
 
 import json
 import re
+from typing import Tuple
 
 # FastMCP 등록용
 from mcp.server.fastmcp import FastMCP
@@ -23,6 +24,104 @@ from vp_mcp.mcp_server.utils.end_rules import (
 MAX_OFFENDER_TURNS = 60
 MAX_VICTIM_TURNS = 60
 
+# ─────────────────────────────────────────────────────────
+# 공격자(JSON) 출력 방어 유틸
+# ─────────────────────────────────────────────────────────
+def _strip_code_fences(s: str) -> str:
+    """```json ... ``` 같은 코드블록 제거"""
+    t = (s or "").strip()
+    # ```json\n{...}\n``` 형태 제거
+    t = re.sub(r"^\s*```(?:json)?\s*", "", t, flags=re.IGNORECASE)
+    t = re.sub(r"\s*```\s*$", "", t)
+    return t.strip()
+
+def _try_extract_first_json_obj(s: str) -> Optional[dict]:
+    """
+    텍스트 안에서 첫 { ... } 블록을 찾아 JSON dict로 파싱 시도.
+    실패하면 None.
+    """
+    t = _strip_code_fences(s)
+    if not t:
+        return None
+
+    # 이미 완전한 JSON처럼 보이면 바로 시도
+    if t.startswith("{") and t.endswith("}"):
+        try:
+            obj = json.loads(t)
+            return obj if isinstance(obj, dict) else None
+        except Exception:
+            pass
+
+    # 앞뒤에 잡텍스트가 섞인 경우: 첫 { 와 마지막 } 사이를 잘라 시도
+    l = t.find("{")
+    r = t.rfind("}")
+    if l != -1 and r != -1 and r > l:
+        chunk = t[l : r + 1]
+        try:
+            obj = json.loads(chunk)
+            return obj if isinstance(obj, dict) else None
+        except Exception:
+            return None
+    return None
+
+def _extract_attacker_utterance(attacker_raw: str) -> str:
+    """
+    공격자 출력이 JSON이면 utterance만 추출(피해자에게 전달할 텍스트).
+    실패하면 원문(정리된 형태) 반환.
+    """
+    t = _strip_code_fences(attacker_raw)
+    obj = _try_extract_first_json_obj(t)
+    if isinstance(obj, dict):
+        u = obj.get("utterance")
+        if isinstance(u, str) and u.strip():
+            return u.strip()
+    return t
+
+def _force_attacker_json(attacker_raw: str) -> str:
+    """
+    공격자 출력이:
+    - 종료 문구면 그대로 반환(한 줄)
+    - 이미 JSON(dict)이고 'utterance' 있으면 (가능하면) 정규화하여 반환
+    - 그 외면 utterance에 래핑해서 JSON으로 강제
+    """
+    t = _strip_code_fences(attacker_raw)
+
+    # 종료 훅이면 JSON 강제하지 않음
+    if attacker_declared_end(t):
+        # 종료 문구는 정확히 한 줄일 필요가 있으면 여기서 정규화 가능
+        # (현재 end_rules에서 변형 포함 감지라면, 트리거 문구로 강제해도 됨)
+        if ATTACKER_TRIGGER_PHRASE in t:
+            return ATTACKER_TRIGGER_PHRASE
+        return t
+
+    obj = _try_extract_first_json_obj(t)
+    if isinstance(obj, dict) and isinstance(obj.get("utterance"), str) and obj["utterance"].strip():
+        # 필드 누락 보정(ATTACKER_V2 스펙 기준)
+        norm = {
+            "utterance": obj.get("utterance", "").strip(),
+            "proc_code": obj.get("proc_code", "") or "",
+            "ppse_labels": obj.get("ppse_labels", []) or [],
+        }
+        # ppse_labels 타입 보정
+        if not isinstance(norm["ppse_labels"], list):
+            norm["ppse_labels"] = []
+        norm["ppse_labels"] = [str(x) for x in norm["ppse_labels"]][:3]
+        return json.dumps(norm, ensure_ascii=False)
+
+    # 자유 텍스트면 래핑
+    # 너무 길면 350자 컷
+    short = (t or "").strip()
+    if len(short) > 350:
+        short = short[:350].rstrip()
+    if not short:
+        short = "확인을 위해 몇 가지 사항을 여쭙겠습니다."
+
+    wrapped = {
+        "utterance": short,
+        "proc_code": "2-2",      # 기본값(목적 안내) 같은 걸로 잡아둠. 필요 시 변경
+        "ppse_labels": [],
+    }
+    return json.dumps(wrapped, ensure_ascii=False)
 
 # ─────────────────────────────────────────────────────────
 # FastMCP에 툴 등록 (server.py에서 호출)
@@ -179,8 +278,11 @@ def simulate_dialogue_impl(input_obj: SimulationInput) -> Dict[str, Any]:
         history_victim: list = []
         turn_index = 0
         attacks = replies = 0
-        last_victim_text = ""
-        last_offender_text = ""
+        # 원본(저장/피해자 히스토리용) vs 공격자 입력용(dialogue만) 분리
+        last_victim_raw = ""
+        last_victim_dialogue = ""
+        last_offender_text = ""        # 피해자에게 넘길 "utterance"만
+        last_offender_raw = ""         # DB/로그용 원본(JSON)
         guidance_text = (input_obj.guidance or {}).get("text") or ""
         guidance_type = (input_obj.guidance or {}).get("type") or ""
         max_turns = input_obj.max_turns
@@ -206,12 +308,18 @@ def simulate_dialogue_impl(input_obj: SimulationInput) -> Dict[str, Any]:
 
             attacker_text = atk.next(
                 history=history_attacker,
-                last_victim=last_victim_text,
+                # 공격자에게는 피해자 dialogue만 제공
+                last_victim=last_victim_dialogue,
                 current_step="",  # 필요 시 단계 주입
                 guidance=guidance_text,
                 guidance_type=guidance_type,
             )
 
+            # ✅ 공격자 출력 방어:
+            # - 종료 문구면 그대로
+            # - 그 외면 JSON 강제(ATTACKER_V2 스펙에 맞춤)
+            attacker_text = _force_attacker_json(attacker_text)
+            attacker_utterance = _extract_attacker_utterance(attacker_text)
             # 저장(반쪽턴: 공격자)
             db.add(TurnLog(
                 conversation_id=conversation_id,
@@ -225,12 +333,15 @@ def simulate_dialogue_impl(input_obj: SimulationInput) -> Dict[str, Any]:
             # 히스토리
             try:
                 from langchain_core.messages import AIMessage, HumanMessage
+                # 공격자는 자기 출력 형식(JSON)을 계속 유지하는 게 자연스러워서 raw를 넣고,
                 history_attacker.append(AIMessage(attacker_text))
-                history_victim.append(HumanMessage(attacker_text))
+                # 피해자에게는 meta 누출 최소화를 위해 utterance만 전달
+                history_victim.append(HumanMessage(attacker_utterance))
             except Exception:
                 pass
 
-            last_offender_text = attacker_text
+            last_offender_raw = attacker_text
+            last_offender_text = attacker_utterance
             turn_index += 1
             attacks += 1
 
@@ -281,7 +392,7 @@ def simulate_dialogue_impl(input_obj: SimulationInput) -> Dict[str, Any]:
 
             victim_text = vic.next(
                 history=history_victim,
-                last_offender=last_offender_text,
+                last_offender=last_offender_text,  # ✅ 이제 utterance만 들어감
                 meta=victim_meta,
                 knowledge=victim_knowledge,
                 traits=victim_traits,
@@ -290,6 +401,7 @@ def simulate_dialogue_impl(input_obj: SimulationInput) -> Dict[str, Any]:
             )
             # 피해자 출력 JSON 강제/정규화
             victim_text = _force_victim_json(victim_text)
+            victim_dialogue = _extract_victim_dialogue(victim_text)
 
             db.add(TurnLog(
                 conversation_id=conversation_id,
@@ -302,16 +414,20 @@ def simulate_dialogue_impl(input_obj: SimulationInput) -> Dict[str, Any]:
 
             try:
                 from langchain_core.messages import AIMessage, HumanMessage
+                # 피해자 히스토리에는 원본 JSON을 넣어도 괜찮음(자기 상태 유지용)
                 history_victim.append(AIMessage(victim_text))
-                history_attacker.append(HumanMessage(victim_text))
+                # 공격자 히스토리에는 dialogue만 넣어 메타 유출 방지
+                history_attacker.append(HumanMessage(victim_dialogue))
             except Exception:
                 pass
 
-            last_victim_text = victim_text
+            last_victim_raw = victim_text
+            last_victim_dialogue = victim_dialogue
             turn_index += 1
             replies += 1
 
             # 피해자 종료 의사 → 공격자 한 줄 주입 후 즉시 종료
+            # 종료 판정은 원본 JSON 기반(내부 util이 dialogue 파싱할 가능성 높음)
             if victim_declared_end(victim_text):
                 if attacks < MAX_OFFENDER_TURNS:
                     attacker_text = ATTACKER_TRIGGER_PHRASE  # "여기서 마무리하겠습니다."
@@ -390,6 +506,22 @@ def simulate_dialogue_impl(input_obj: SimulationInput) -> Dict[str, Any]:
     finally:
         db.close()
 
+def _extract_victim_dialogue(text: str) -> str:
+    """
+    피해자 출력이 JSON이면 dialogue만 추출해서 공격자 입력에 사용.
+    실패하면 원문 그대로 반환.
+    """
+    t = (text or "").strip()
+    if t.startswith("{") and t.endswith("}"):
+        try:
+            obj = json.loads(t)
+            if isinstance(obj, dict):
+                d = obj.get("dialogue")
+                if isinstance(d, str) and d.strip():
+                    return d.strip()
+        except Exception:
+            pass
+    return t
 
 # ─────────────────────────────────────────────────────────
 # 출력 보정 유틸

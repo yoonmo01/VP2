@@ -10,6 +10,7 @@ import json, ast, re
 
 from app.services.prompts import (
     ATTACKER_PROMPT,
+    ATTACKER_PROMPT_V2,
     VICTIM_PROMPT,
     render_victim_from_profile,
     render_attacker_system_string,   # ✅ 추가
@@ -155,7 +156,7 @@ def make_sim_tools(db: Session):
     @tool(
         "sim.fetch_entities",
         args_schema=SingleData,
-        description="DB에서 공격자/피해자/시나리오를 읽어 에이전트 입력 묶음을 만든다(steps는 요청>공격자프로필 순). Action Input은 {'data': {'offender_id':int,'victim_id':int,'scenario':{...}}}"
+        description="DB에서 공격자/피해자/시나리오를 읽어 에이전트 입력 묶음을 만든다(steps는 요청에 있는 경우만 유지). Action Input은 {'data': {'offender_id':int,'victim_id':int,'scenario':{...}}}"
     )
     def fetch_entities(data: Any) -> Dict[str, Any]:
         payload = _unwrap_data(data)  # ✅ 래핑/주석/예시 모두 허용
@@ -184,18 +185,26 @@ def make_sim_tools(db: Session):
             "traits": getattr(vic, "traits", None) or (getattr(vic, "body", {}) or {}).get("traits", {}),
         }
 
-        # steps 우선순위: 요청→공격자 프로필
-        req_steps = scenario.get("steps")
-        off_steps = (off.profile or {}).get("steps")
-        steps = req_steps if isinstance(req_steps, list) else (off_steps if isinstance(off_steps, list) else [])
+        # ✅ 요구사항 반영:
+        # - attacker_prompt_v2는 시나리오/steps에 의존하지 않음
+        # - steps는 "요청 payload에 있는 경우만" 유지하고,
+        #   공격자 프로필(off.profile.steps)에서 fallback 로딩하지 않는다.
+        req_steps = scenario.get("steps", None)
 
-        merged_scenario = {**(off.profile or {}), **(scenario or {}), "steps": steps}
+        merged_scenario = {**(off.profile or {}), **(scenario or {})}
+
+        # 요청에 steps가 있으면 그것만 사용, 없으면 steps 키 자체를 제거(프로필 fallback 방지)
+        if isinstance(req_steps, list):
+            merged_scenario["steps"] = req_steps
+        else:
+            # scenario에 steps가 없거나 형식이 이상하면 제거
+            merged_scenario.pop("steps", None)
         return {"scenario": merged_scenario, "victim_profile": victim_profile}
 
     @tool(
         "sim.compose_prompts",
         args_schema=SingleData,
-        description="시나리오/피해자/지침을 바탕으로 공격자/피해자 프롬프트를 생성한다. Action Input은 {'data': {'scenario':{...},'victim_profile':{...},'guidance':{'type':'A|P','text':'...'}, 'round_no':int|null, 'case_id':str|null, 'case_id_override':str|null}}"
+        description="시나리오/피해자/지침을 바탕으로 공격자(V2)/피해자 프롬프트를 생성한다. Action Input은 {'data': {'scenario':{...},'victim_profile':{...},'guidance':{'type':'A|P','text':'...'}, 'round_no':int|null, 'case_id':str|null, 'case_id_override':str|null}}"
     )
     def compose_prompts(data: Any) -> Dict[str, str]:
         """
@@ -218,16 +227,17 @@ def make_sim_tools(db: Session):
         if guidance and not case_id and (round_no is None or int(round_no) <= 1):
             guidance = None
 
-        # 현재 단계 계산
-        steps = scenario.get("steps") or []
-        current_step = (steps[0] if steps else scenario.get("description") or "시뮬레이션 시작")
-
-        # ✅ 공격자 system 프롬프트
-        attacker_prompt = render_attacker_system_string(
-            scenario=scenario,
-            current_step=current_step,
-            guidance=guidance,
+        # ✅ 공격자 프롬프트: ATTACKER_PROMPT_V2 사용
+        # - scenario/steps/current_step 로딩 불필요 (절차 선택은 MCP/시뮬레이터 측에서 처리)
+        # - logs에서 V2 반영이 "증명"되도록 version tag 삽입
+        v2_messages = ATTACKER_PROMPT_V2.format_messages(
+            history=[],
+            previous_turns_block="직전 대화 없음.",
         )
+        attacker_prompt = "\n\n".join(
+            [m.content for m in v2_messages if getattr(m, "content", None)]
+        )
+        attacker_prompt = "[PROMPT_VERSION=ATTACKER_V2]\n" + attacker_prompt
 
         # ✅ 피해자 system 프롬프트
         victim_prompt = render_victim_system_string(

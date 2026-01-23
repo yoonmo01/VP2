@@ -68,6 +68,11 @@ SURPRISE_THREAT_MIN_SCORE = 3
 SURPRISE_ANGER_MIN_SCORE = 1
 SURPRISE_MIN_PROB = 0.20
 
+# ✅ 정책: pred8이 "놀라움"으로 확정되면(=argmax) 임계값과 무관하게 항상 N/F/A로 치환할지
+# - 기본 True(1): 사용자가 원하는 "놀라움이면 반드시 치환"을 보장
+# - 끄고 싶으면 .env에서 EMOTION_SURPRISE_FORCE_IF_PRED8=0
+SURPRISE_FORCE_IF_PRED8 = (os.getenv("EMOTION_SURPRISE_FORCE_IF_PRED8", "1") or "").strip().lower() in (
+    "1", "true", "yes", "y", "on")
 
 def _contains_any(text: str, cues: List[str]) -> int:
     t = (text or "").lower()
@@ -112,6 +117,7 @@ def probs8_to_probs4_with_postprocess(
     labels8: List[str],
     text: str,
     text_pair: Optional[str],
+    pred8: Optional[str] = None,
 ) -> Dict[str, Any]:
     pN = pF = pA = pE = 0.0
     p_surprise = 0.0
@@ -140,11 +146,20 @@ def probs8_to_probs4_with_postprocess(
     cue_scores = {"threat_score": 0, "anger_score": 0}
 
     if surprise_idx is not None:
-        if (not HANDLE_SURPRISE) or (p_surprise < SURPRISE_MIN_PROB):
+        # ✅ 정책:
+        # 1) pred8이 "놀라움"이면(=확정 놀라움) 임계값과 무관하게 항상 N/F/A로 치환(기본 ON)
+        # 2) 그 외에는 기존대로 p_surprise >= SURPRISE_MIN_PROB 일 때만 단서 기반 치환
+        force_route = bool(SURPRISE_FORCE_IF_PRED8 and (pred8 == "놀라움"))
+        should_route = force_route or (HANDLE_SURPRISE and (p_surprise >= SURPRISE_MIN_PROB))
+
+        if not should_route:
             surprise_to = "N"
             cue_scores = {"threat_score": 0, "anger_score": 0}
         else:
             surprise_to, cue_scores = decide_surprise_to_4(text, text_pair)
+            # 방어: surprise_to는 N/F/A만 허용 (4클래스에 놀라움/E로 보내는 정책 없음)
+            if surprise_to not in ("N", "F", "A"):
+                surprise_to = "N"
 
         if surprise_to == "N":
             pN += p_surprise
@@ -152,8 +167,6 @@ def probs8_to_probs4_with_postprocess(
             pF += p_surprise
         elif surprise_to == "A":
             pA += p_surprise
-        elif surprise_to == "E":
-            pE += p_surprise
         else:
             pN += p_surprise
 
@@ -294,6 +307,7 @@ class HowruKoelectraEmotionService:
                     labels8=self.labels8,
                     text=text,
                     text_pair=text_pair,
+                    pred8=pred8,
                 )
 
                 out: Dict[str, Any] = {
