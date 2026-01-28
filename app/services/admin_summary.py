@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional
 import os
 import json, re
 import statistics  # ✅ 추가: 평균 계산용
+import math
 
 # =========================
 # tools_emotion / HMM 사용 여부 (.env 스위치)
@@ -144,57 +145,111 @@ def _hmm_summary_text(hmm: Optional[Dict[str, Any]]) -> str:
         f"v3_ratio={None if v3_ratio is None else f'{v3_ratio:.3f}'}, "
         f"path_len={(len(path) if isinstance(path, list) else None)}"
     )
+def _clamp(x: float, lo: float, hi: float) -> float:
+    if x < lo:
+        return lo
+    if x > hi:
+        return hi
+    return x
 
 
-def _adjust_risk_score_with_hmm(base_score: int, hmm: Optional[Dict[str, Any]]) -> int:
+def _extract_pv3_v3ratio(hmm: Dict[str, Any]) -> tuple[Optional[float], Optional[float]]:
     """
-    A안: LLM이 산출한 base_score를 유지하되,
-    HMM의 취약 상태(V3) 신호가 강하면 가산, 약하면 감산.
-    - 최종 0~100 clamp
+    hmm_summary / per-turn hmm 포맷 모두에서
+    - p_v3 (final_probs[2] 또는 posterior[2])
+    - v3_ratio (meta.meta.v3_ratio 또는 path 기반)
+    를 최대한 안정적으로 뽑는다.
     """
-    s = int(base_score)
-    if not hmm:
-        return max(0, min(100, s))
-
-    final_state = hmm.get("final_state")
     final_probs = hmm.get("final_probs")
     path = hmm.get("path")
+    meta = hmm.get("meta") or {}
 
-    # per-turn hmm 형태 대응
-    if final_state is None and isinstance(hmm.get("viterbi"), str):
-        final_state = hmm.get("viterbi")
+    # per-turn 포맷 대응
     if final_probs is None and isinstance(hmm.get("posterior"), (list, tuple)):
         final_probs = list(hmm.get("posterior"))
 
-    # v3_ratio 계산
-    v3_ratio = None
-    if isinstance(path, list) and path:
-        norm_path = [str(x).upper() for x in path if x is not None]
-        if norm_path:
-            v3_ratio = norm_path.count("V3") / float(len(norm_path))
-
-    # pV3 추정
-    p_v3 = None
+    p_v3: Optional[float] = None
     if isinstance(final_probs, (list, tuple)) and len(final_probs) == 3:
         try:
             p_v3 = float(final_probs[2])
         except Exception:
             p_v3 = None
 
-    st = str(final_state).upper() if final_state is not None else None
+    v3_ratio: Optional[float] = None
+    # meta 중첩(meta.meta) 구조를 우선 지원
+    m = meta.get("meta") if isinstance(meta.get("meta"), dict) else meta
+    if isinstance(m, dict) and "v3_ratio" in m:
+        try:
+            v3_ratio = float(m["v3_ratio"])
+        except Exception:
+            v3_ratio = None
 
-    # --- 보정 규칙(보수적) ---
-    # 강한 취약 신호: V3 이거나 pV3>=0.55, v3_ratio>=0.45
-    if (st == "V3") or (p_v3 is not None and p_v3 >= 0.55) or (v3_ratio is not None and v3_ratio >= 0.45):
-        s += 10
-    # 중간 신호: V2 이거나 pV3 0.40~0.55, v3_ratio 0.30~0.45
-    elif (st == "V2") or (p_v3 is not None and 0.40 <= p_v3 < 0.55) or (v3_ratio is not None and 0.30 <= v3_ratio < 0.45):
-        s += 5
-    # 약한 신호: V1 이거나 pV3<0.25 & v3_ratio<0.20이면 약간 감산(과대평가 방지)
-    elif (st == "V1") or ((p_v3 is not None and p_v3 < 0.25) and (v3_ratio is not None and v3_ratio < 0.20)):
-        s -= 5
+    # 없으면 path에서 계산
+    if v3_ratio is None and isinstance(path, list) and path:
+        norm = [str(x).lower() for x in path if x is not None]
+        if norm:
+            v3_ratio = norm.count("v3") / float(len(norm))
 
-    return max(0, min(100, int(s)))
+    return p_v3, v3_ratio
+
+
+def _hmm_weight_from_summary(
+    hmm: Dict[str, Any],
+    *,
+    pivot: float = 0.40,
+    beta: float = 0.70,
+    w_min: float = 0.85,
+    w_max: float = 1.35,
+) -> float:
+    """
+    HMM 신호를 [0,1] 요약값 h로 만든 뒤, odds-space multiplier w로 변환한다.
+    - h 구성: (p_v3, v3_ratio) 둘 다 있으면 0.7/0.3 가중합, 아니면 있는 것 사용
+    - w = exp(beta * (h - pivot))
+    - w는 과증폭 방지 위해 [w_min, w_max]로 clamp
+    """
+    p_v3, v3_ratio = _extract_pv3_v3ratio(hmm)
+
+    if p_v3 is not None and v3_ratio is not None:
+        h = 0.7 * p_v3 + 0.3 * v3_ratio
+    elif p_v3 is not None:
+        h = p_v3
+    elif v3_ratio is not None:
+        h = v3_ratio
+    else:
+        return 1.0
+
+    # pivot(기준점) 대비 취약 신호가 강하면 w>1, 약하면 w<1
+    w = math.exp(beta * (h - pivot))
+    return _clamp(w, w_min, w_max)
+
+
+def _adjust_risk_score_with_hmm(base_score: int, hmm: Optional[Dict[str, Any]]) -> int:
+    """
+    ✅ odds 곱 방식(HMM을 가중치로 곱)
+    - LLM base_score를 prior(probability)로 보고,
+        odds = p/(1-p) 에 HMM weight(w)를 곱한 뒤 다시 p로 환산.
+    - +10점 같은 임의 가산/감산 규칙은 완전히 제거.
+    """
+    s = int(base_score)
+    s = max(0, min(100, s))
+    if not hmm:
+        return s
+
+    w = _hmm_weight_from_summary(hmm)
+    # HMM 신호가 없으면 w=1.0이므로 base 유지
+    if w == 1.0:
+        return s
+
+    # score -> probability
+    eps = 1e-6
+    p = _clamp(s / 100.0, eps, 1.0 - eps)
+    o = p / (1.0 - p)
+
+    # odds multiply
+    o2 = o * w
+    p2 = o2 / (1.0 + o2)
+    s2 = int(round(100.0 * p2))
+    return max(0, min(100, s2))
 
 # =========================
 # role/turn 정규화 유틸
