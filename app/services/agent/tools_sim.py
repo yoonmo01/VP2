@@ -1,3 +1,4 @@
+#VP/app/services/agent/tools_sim.py
 from __future__ import annotations
 from typing import Dict, Any, Optional
 from uuid import UUID
@@ -7,6 +8,7 @@ from langchain_core.tools import tool
 from sqlalchemy.orm import Session
 from app.db import models as m
 import json, ast, re
+import inspect
 
 from app.services.prompts import (
     ATTACKER_PROMPT,
@@ -15,7 +17,21 @@ from app.services.prompts import (
     render_victim_from_profile,
     render_attacker_system_string,   # ✅ 추가
     render_victim_system_string,     # ✅ 추가
+    build_guidance_block_from_meta,
 )
+
+def _call_with_supported_kwargs(fn, **kwargs):
+    """
+    prompts.py 쪽 렌더러의 시그니처가 바뀌어도
+    여기서 지원하는 인자만 골라서 안전하게 호출한다.
+    """
+    try:
+        sig = inspect.signature(fn)
+        supported = set(sig.parameters.keys())
+        filtered = {k: v for k, v in kwargs.items() if k in supported}
+        return fn(**filtered)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Prompt render failed: {fn.__name__}: {e}")
 
 # ---------- 문자열 전처리 유틸(코드펜스/따옴표/첫 JSON 블록만 추출) ----------
 def _strip_code_fences(s: str) -> str:
@@ -218,7 +234,7 @@ def make_sim_tools(db: Session):
         payload = _unwrap_data(data)
         scenario = _unwrap_data(payload.get("scenario") or {})
         victim_profile = _unwrap_data(payload.get("victim_profile") or {})
-        guidance = payload.get("guidance") or {}
+        guidance = payload.get("guidance") or None
 
         round_no = payload.get("round_no")
         case_id  = payload.get("case_id") or payload.get("case_id_override")
@@ -227,29 +243,31 @@ def make_sim_tools(db: Session):
         if guidance and not case_id and (round_no is None or int(round_no) <= 1):
             guidance = None
 
-        # ✅ 공격자 프롬프트: ATTACKER_PROMPT_V2 사용
-        # - scenario/steps/current_step 로딩 불필요 (절차 선택은 MCP/시뮬레이터 측에서 처리)
-        # - logs에서 V2 반영이 "증명"되도록 version tag 삽입
-        v2_messages = ATTACKER_PROMPT_V2.format_messages(
-            history=[],
-            previous_turns_block="직전 대화 없음.",
-        )
-        attacker_prompt = "\n\n".join(
-            [m.content for m in v2_messages if getattr(m, "content", None)]
-        )
-        attacker_prompt = "[PROMPT_VERSION=ATTACKER_V2]\n" + attacker_prompt
+        rn = int(round_no) if round_no is not None else 1
 
-        # ✅ 피해자 system 프롬프트
-        victim_prompt = render_victim_system_string(
+        # ✅ 정석: prompts.py의 render 함수만 호출
+        # - render_attacker_system_string은 prompts.py에서 'V2 고정'으로 바뀐 상태
+        attacker_system = _call_with_supported_kwargs(
+            render_attacker_system_string,
+            scenario=scenario,
+            guidance=guidance,
+            current_step="",   # V2에서는 의미 없지만 시그니처 호환을 위해 전달해도 됨
+        )
+        victim_system = _call_with_supported_kwargs(
+            render_victim_system_string,
             victim_profile=victim_profile,
-            round_no=int(round_no) if round_no else 1,
+            round_no=rn,
             previous_experience="",
             is_convinced_prev=None,
         )
 
         return {
-            "attacker_prompt": attacker_prompt,
-            "victim_prompt": victim_prompt,
+            # ✅ 정석 키(권장)
+            "attacker": {"system": attacker_system},
+            "victim": {"system": victim_system},
+            # ✅ 하위호환 키(기존 코드 대비)
+            "attacker_prompt": attacker_system,
+            "victim_prompt": victim_system,
         }
 
 

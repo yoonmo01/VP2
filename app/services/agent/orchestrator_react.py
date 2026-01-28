@@ -923,14 +923,79 @@ def _wrap_tool_force_json_input(original_tool, *, require_data_wrapper: bool = T
         except Exception:
             pass
 
-        try:
-            out = original_tool.invoke(parsed)
-        except Exception as e:
-            return {
-                "ok": False,
-                "error": "tool_invoke_failed",
-                "message": str(e),
-            }
+        # ─────────────────────────────────────────
+        # ✅ admin.generate_guidance run_no 보정(안전장치)
+        # - LLM이 실수로 다음 라운드 번호(N+1)로 호출하면 no_saved_verdict가 발생
+        # - 이 경우 run_no를 1 감소시켜 1회만 자동 재시도한다.
+        # ─────────────────────────────────────────
+        def _looks_like_no_saved_verdict(x: Any) -> bool:
+            try:
+                if x is None:
+                    return False
+                if isinstance(x, dict):
+                    s = json.dumps(x, ensure_ascii=False)
+                else:
+                    s = str(x)
+                s_low = s.lower()
+                return ("no_saved_verdict" in s_low) or ("saved_verdict" in s_low and "no_" in s_low) or ("verdict" in s_low and "not found" in s_low)
+            except Exception:
+                return False
+
+        tool_name = getattr(original_tool, "name", "") or ""
+        if tool_name == "admin.generate_guidance":
+            d = parsed.get("data") if isinstance(parsed.get("data"), dict) else parsed
+            run_no_raw = None
+            try:
+                run_no_raw = d.get("run_no") or d.get("run")
+            except Exception:
+                run_no_raw = None
+            try:
+                run_no_int = int(run_no_raw) if run_no_raw is not None else None
+            except Exception:
+                run_no_int = None
+
+            try:
+                out = original_tool.invoke(parsed)
+            except Exception as e:
+                # invoke 예외도 no_saved_verdict 성격이면 한 번 보정 시도
+                if run_no_int is not None and run_no_int > 1 and _looks_like_no_saved_verdict(str(e)):
+                    fixed = run_no_int - 1
+                    try:
+                        d["run_no"] = fixed
+                        if "data" in parsed and isinstance(parsed["data"], dict):
+                            parsed["data"] = d
+                        else:
+                            parsed = {"data": d} if require_data_wrapper else d
+                        logger.warning("[GuidanceRunNoFix] tool=admin.generate_guidance run_no %s -> %s (retry after exception)", run_no_int, fixed)
+                        out = original_tool.invoke(parsed)
+                    except Exception as e2:
+                        return {"ok": False, "error": "tool_invoke_failed", "message": str(e2)}
+                else:
+                    return {"ok": False, "error": "tool_invoke_failed", "message": str(e)}
+
+            # 정상 반환이 dict인데 no_saved_verdict면 한 번 보정 재시도
+            if run_no_int is not None and run_no_int > 1 and _looks_like_no_saved_verdict(out):
+                fixed = run_no_int - 1
+                try:
+                    d["run_no"] = fixed
+                    if "data" in parsed and isinstance(parsed["data"], dict):
+                        parsed["data"] = d
+                    else:
+                        parsed = {"data": d} if require_data_wrapper else d
+                    logger.warning("[GuidanceRunNoFix] tool=admin.generate_guidance run_no %s -> %s (retry)", run_no_int, fixed)
+                    out2 = original_tool.invoke(parsed)
+                    out = out2
+                except Exception as e:
+                    return {"ok": False, "error": "tool_invoke_failed", "message": str(e)}
+        else:
+            try:
+                out = original_tool.invoke(parsed)
+            except Exception as e:
+                return {
+                    "ok": False,
+                    "error": "tool_invoke_failed",
+                    "message": str(e),
+                }
         # ─────────────────────────────────────────
         # ✅ (2) label_victim_emotions 결과 캐시 저장
         # - input에 run_no를 반드시 포함시키도록 case_mission도 함께 수정되어야 함

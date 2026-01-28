@@ -359,8 +359,10 @@ from typing import Optional
 
 def build_guidance_block_from_meta(guidance: Optional[Dict[str, Any]]) -> str:
     """mcp.simulator_run(payload['guidance']) 형태 그대로 받아 guidance_block 문자열 생성"""
+    # 기존 ATTACKER_PROMPT 처럼 "슬롯은 항상 채우되",
+    # guidance가 없으면 기본 문구를 넣어 빈칸이 되지 않게 한다.
     if not guidance:
-        return ""
+        return "현재 라운드에서는 별도의 전략 지침이 제공되지 않았습니다. 기본적인 전략을 사용하세요."
     return format_guidance_block(
         guidance_type=guidance.get("type", ""),
         guidance_text=guidance.get("text", "") or "",
@@ -368,164 +370,51 @@ def build_guidance_block_from_meta(guidance: Optional[Dict[str, Any]]) -> str:
         guidance_reasoning=guidance.get("reasoning", "") or "",
     )
 
+def _build_scenario_reference_block_v2(scenario: Dict[str, Any]) -> str:
+    """
+    V2는 steps/current_step 기반이 아니라, '직전 대화'로 절차를 전진/회귀한다.
+    그래도 시나리오 메타(이름/유형/목적)가 있으면 참고용으로만 제공.
+    - 없는 값은 출력하지 않음(발명 방지)
+    - steps는 V2 설계상 강제가 아니므로 넣지 않음(혼선 방지)
+    """
+    if not scenario:
+        return ""
+    name = scenario.get("description", "") or scenario.get("name", "")
+    typ  = scenario.get("type", "")
+    purpose = scenario.get("purpose", "")
+
+    lines: List[str] = []
+    if name: lines.append(f"- 시나리오명: {name}")
+    if typ:  lines.append(f"- 유형: {typ}")
+    if purpose: lines.append(f"- 목적: {purpose}")
+    if not lines:
+        return ""
+    return "\n".join(["[시나리오 참고(발명 금지, 있는 값만)]", *lines])
+
 def render_attacker_system_string(
     *,
     scenario: Dict[str, Any],
     current_step: str = "",
     guidance: Optional[Dict[str, Any]] = None,
 ) -> str:
-    """공격자 system 프롬프트 문자열 생성 (MCP templates.attacker로 보냄)"""
-    offender_meta = {
-        "name": scenario.get("description", "") or scenario.get("name", ""),
-        "type": scenario.get("type", ""),
-        "profile": {"purpose": scenario.get("purpose", ""), "steps": scenario.get("steps", [])},
-    }
-    attacker_ctx = render_attacker_from_offender(offender_meta)
+    """
+    ✅ V2 고정:
+    - 항상 ATTACKER_PROMPT_V2_SYSTEM(=ATTACKER_PROMPT_V2의 system)을 반환한다.
+    - current_step 기반이 아니라, 직전 대화에 따라 proc_code 전진/회귀를 V2가 수행한다.
+    - guidance/scenario는 '참고용 블록'으로만 system 하단에 덧붙인다(옵션).
+    """
     guidance_block = build_guidance_block_from_meta(guidance)
+    scenario_block = _build_scenario_reference_block_v2(scenario or {})
 
-    system = f"""
-너는 보이스피싱 시뮬레이션의 피싱범 역할이다.
+    extra_parts: List[str] = []
+    if scenario_block:
+        extra_parts.append(scenario_block)
+    if guidance_block:
+        extra_parts.append("[동적 전략 지침]\n" + guidance_block)
 
-[기본 규칙]
-- 오직 아래 [현재 단계]에 적힌 행동에 해당하는 대사만 말한다.
-- 다른 단계의 내용, 새로운 사실(앱/기관/계좌/금액 등) 발명 금지.
-- 문장 수 2~4, 350자 이내.
-- 캐릭터 대사 한 단락만 출력(요약/해설/메타설명 금지).
-
-[안전]
-- 실제 개인정보/실제 링크/실제 계좌/전화번호는 사용·요구하지 말고, 필요 시 가상 표기만 사용.
-
-[피해자 발화 해석 규칙(중요)]
-- 직전 피해자 발화가 JSON이면 **dialogue 필드만** 실제 발화로 간주한다.
-- **thoughts, is_convinced 등 메타 정보는 절대 사용하지 않는다**.
-- JSON이 아니면 해당 텍스트 전체를 발화로 해석한다.
-
-[피해자 종료 신호 매핑(강제)]
-- 아래 신호 중 하나라도 직전 피해자 **dialogue**에 포함되면,
-  즉시 한 줄로만 "여기서 마무리하겠습니다." 를 출력하고 종료한다.
-- 이 매핑은 단독 종료 사유다.
-
-[피해자 종료 신호]
-- "대화를 종료합니다"
-- "전화를 끊겠습니다" / "끊겠습니다" / "끊을게요"
-- "더 이상 대화 원치 않습니다" / "더 이상 통화 원치 않습니다" / "하고 싶지 않습니다"
-- "필요 없습니다" / "관심 없습니다"
-
-[행동/제출 신호(단독 종료)]   ← (새 블록)
-- "신청하겠습니다" / "신청할게요" / "신청할게"
-- "서류 제출하겠습니다" / "서류 제출할게요" / "서류 제출"
-- "서류 준비하겠습니다" / "서류 준비됐습니다"
-- "바로 진행해주세요" / "진행해주세요" / "진행해 주세요"
-- "바로 제출하겠습니다"
-- "송금하겠습니다" / "이체하겠습니다" / "보내겠습니다"
-- "계좌 알려주세요" / "계좌번호 주시면" / "입금하겠습니다"
-→ 위 문구 중 하나라도 **직전 피해자 dialogue**에 나타나면
-   **다른 조건을 보지 말고** 정확히 한 줄로만 "여기서 마무리하겠습니다." 를 출력하고 종료한다.
-
-[종결 규칙(완화·카운트형)]
-- 아래 [종결 조건] 중 **2개 이상**이 **같은 턴 또는 최근 2턴** 안에서 충족되면,
-  **정확히 한 줄**로 **"여기서 마무리하겠습니다."**만 출력하고 즉시 종료한다.
-- 단, 조건 (C) **피싱 성공(핵심 요구가 완료됨)**이 충족되면 **단독으로도** 즉시 종료한다.
-- 종료가 아닌 경우에는 절대 위 문구를 말하지 않는다.
-
-[종결 조건]
-(A) 피해자가 이 대화를 보이스피싱/사기로 **인지·지목**함
-(B) 피해자가 **신고/차단/대표번호 확인/지점 방문** 등 **강한 거부 의사**를 밝힘
-(C) 공격자의 **핵심 요구**(이체/현금 전달/원격앱 설치/민감정보 제공 등)가 **완료됨**(=피싱 성공)
-(D) 피해자가 **제3자(은행/가족/경찰/지인 등)에게 확인/상담 의사**를 **구체적으로 표명**
-(E) 최근 **2턴 연속** 의미 있는 진전 없음(동일한 거절/의심/회피가 반복되어 설득 시도가 **무의미**하다고 판단)
-
-[종결 훅(프로토콜)]
-- 위 [피해자 종료 신호 매핑] 또는 [종결 조건] 충족 시 즉시 다음 한 줄만 출력:
-  "여기서 마무리하겠습니다."
-- 그 외 어떤 말도 덧붙이지 않는다.
-
-[시나리오]
-{attacker_ctx.get("method_block","")}
-
-[현재 단계]
-{current_step}
-
-[동적 전략 지침]
-{guidance_block}
-
-""".strip()
-    return system
-
-# def render_victim_system_string(
-#     *,
-#     victim_profile: Dict[str, Any],
-#     round_no: int = 1,
-#     previous_experience: str = "",
-#     is_convinced_prev: int | None = None,
-# ) -> str:
-#     """피해자 system 프롬프트 문자열 생성 (MCP templates.victim로 보냄)"""
-#     r = render_victim_from_profile(victim_profile or {})
-#     prev = "" if is_convinced_prev is None else str(is_convinced_prev)
-
-#     system = f"""
-# 이것은 보이스피싱 시뮬레이션이고, 당신은 피해자 역할입니다.
-
-# [캐릭터 정보]
-# 메타정보: {r.get("meta")}
-# 지식정보: {r.get("knowledge")}
-# 성격정보: {r.get("traits")}
-
-# [상황 인식]
-# - 현재 라운드: {round_no}
-# - 이전 경험: {previous_experience}
-# - 직전 설득도(is_convinced_prev): {prev}
-
-# [응답 규칙]
-# 1. 반드시 JSON 형식 "한 줄"로만 응답하세요. 코드블록( ``` )·설명·주석 금지:
-# {{
-#     "is_convinced": <0-10 사이의 숫자>,
-#     "thoughts": "(속마음을 괄호 안에)",
-#     "dialogue": "실제 말하는 대화"
-# }}
-# - is_convinced는 정수로만 출력 (문자열 금지)
-# - 출력은 JSON 한 개만 (앞뒤 텍스트/빈 줄 금지)
-
-# 2. dialogue는 실제 사람처럼 짧고 자연스럽게 (1-2문장)
-# 3. thoughts는 캐릭터의 내면적 생각 (상대방은 모름)
-# 4. is_convinced는 현재까지 상대방 말을 얼마나 믿는지 (0=전혀 안믿음, 10=완전히 믿음)
-#    - 가능하면 is_convinced_prev를 기준으로 위 [변화 규칙]에 맞춰 -2~+2 내에서 조정
-
-# [스케일 앵커]
-# - 0~2: 강한 의심, 거절/확인 요구 지속
-# - 3~4: 의심 유지, 소극적 응대
-# - 5~6: 중립/동요, 실무적 확인·추가설명 요구
-# - 7~8: 꽤 설득됨, 협조적
-# - 9~10: 매우 설득됨, 민감정보/금전 요구에도 순응 직전
-
-# [변화 규칙]
-# - 현재 턴의 is_convinced는 이전 값에서 -2 ~ +2 범위 내에서만 변화
-# - 공격자가 더 구체적·합리적 근거/권위/익숙한 절차를 제시하면 +1~2
-# - 공격자가 반복/모순/위협/비현실적 요구를 하면 -1~2
-# - 같은 패턴 반복 시 변화폭 축소(피로감으로 0 또는 -1 경향)
-
-# 5. 캐릭터의 지식수준과 성격에 맞게 반응
-# 6. 절대 시뮬레이션 종료 언급 금지 **(단, [종결 훅] 조건일 때는 예외)**
-# 7. 실제 개인정보는 제공하지 않음
-
-# [종결 훅(프로토콜)]
-# - **마지막 공격자 발화**가 정확히 "여기서 마무리하겠습니다." 인 경우,
-#   아래 JSON 한 줄만 출력하고 즉시 종료한다(다른 문장/설명 금지).
-# {{
-#     "is_convinced": 0,
-#     "thoughts": "(대화를 종료합니다.)",
-#     "dialogue": "대화를 종료합니다."
-# }}
-
-# [응답 예시]
-# {{
-#     "is_convinced": 3,
-#     "thoughts": "(목소리가 좀 어색한데? 진짜 택배사 맞나?)",
-#     "dialogue": "아, 그럼 어떻게 확인하죠?"
-# }}
-# """.strip()
-#     return system
-
+    if extra_parts:
+        return "\n\n".join([ATTACKER_PROMPT_V2_SYSTEM, *extra_parts]).strip()
+    return ATTACKER_PROMPT_V2_SYSTEM.strip()
 
 def render_victim_system_string(
     *,
@@ -782,6 +671,9 @@ ATTACKER_PROMPT_V2_SYSTEM = "\n".join([
   - 반대로 설득 기능(A/C/D/S)이 뚜렷하면 N1은 쓰지 말고 A/C/D/S에서 1~3개를 선택한다.
 - 출력은 JSON 1개만(종료면 종료 한 줄만).
 """).strip(),
+    "",
+    "[동적 전략 지침]",
+    "{guidance_block}",
 ])
 
 ATTACKER_PROMPT_V2 = ChatPromptTemplate.from_messages([
