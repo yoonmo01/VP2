@@ -34,6 +34,7 @@ from app.routers import react_agent_stream_router
 # React Agent 라우터만 추가
 from app.routers import react_agent_router
 from app.routers import tts_router
+from app.api.routes import external_integration
 
 print(f"[DEBUG] TTS Router loaded: {tts_router.router}")
 print(f"[DEBUG] TTS Router routes: {[route.path for route in tts_router.router.routes]}")
@@ -90,6 +91,9 @@ app.include_router(react_agent_router.router, prefix=settings.API_PREFIX)
 
 app.include_router(react_agent_stream_router.router, prefix=settings.API_PREFIX)
 app.include_router(tts_router.router, prefix=f"{settings.API_PREFIX}/tts")
+
+# 외부 시스템 연동 API
+app.include_router(external_integration.router)
 
 
 

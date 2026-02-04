@@ -974,13 +974,44 @@ def make_admin_tools(db: Session, guideline_repo):
             except Exception:
                 pass
 
-        return {
+        # ★ 연속 피싱 실패 시 외부 API 호출 체크
+        external_api_result = None
+        try:
+            from app.services.agent.external_api import check_and_trigger_external_api
+            phishing_result = bool(verdict.get("phishing", False))
+
+            external_api_result = check_and_trigger_external_api(
+                case_id=str(ji.case_id),
+                phishing=phishing_result,
+                turns=normalized_turns,
+                scenario={},  # 필요 시 payload에서 추출
+                victim_profile={},
+                guidance={},
+                judgement=verdict,
+                round_no=ji.run_no,
+            )
+
+            if external_api_result and external_api_result.get("triggered"):
+                logger.info(
+                    "[admin.make_judgement] 외부 API 호출됨: %s",
+                    external_api_result.get("reason")
+                )
+        except Exception as e:
+            logger.warning("[admin.make_judgement] 외부 API 체크 실패: %s", e)
+
+        result = {
             "ok": True,
             "persisted": persisted,
             "case_id": str(ji.case_id),
             "run_no": ji.run_no,
             **verdict,
         }
+
+        # 외부 API 결과가 있으면 포함
+        if external_api_result:
+            result["external_api"] = external_api_result
+
+        return result
 
     @tool(
         "admin.judge",
