@@ -329,7 +329,7 @@ E) **지속적 고신뢰 + 명시적 실행 의사(실행 직전 단계)**   # �
 
 [취약성(victim_vulnerabilities) 예시]
 - “권위/긴급 호소에 취약”, “검증 없이 링크/QR 응답”, “금융 지식 부족”, “원격제어/앱 설치 거부 약함”, “개인정보 요구에 관대” 등
-- 최대 3~6개, 간결한 문장형
+- 최대 2~4개, 간결한 문장형
 
 [다음 라운드 진행 권고(continue)]
 - {{\"recommendation\":\"continue\"|\"stop\",\"reason\":\"...\"}}
@@ -344,7 +344,7 @@ E) **지속적 고신뢰 + 명시적 실행 의사(실행 직전 단계)**   # �
   - 인용 예: turn 7 [피해자] \\\"700만원 송금했어요\\\", turn 10 [피해자] \\\"락커 24번에 넣었습니다\\\"
   - 큰따옴표는 반드시 \\\" 로 이스케이프할 것
 - \"risk\": {{\"score\": 정수 0~100, \"level\": \"low\"|\"medium\"|\"high\"|\"critical\", \"rationale\": \"한 단락\"}}
-- \"victim_vulnerabilities\": [문자열, ...] (3~6개)
+- \"victim_vulnerabilities\": [문자열, ...] (2~4개)
 - \"continue\": {{\"recommendation\":\"continue\"|\"stop\",\"reason\":\"한 단락\"}}
 - **문자열 내부에서 \" 는 반드시 \\\" 로 이스케이프.** (어렵다면 『 』 사용 가능)
 
@@ -377,15 +377,16 @@ PROMPT_VULN_WITH_HMM_ONLY = """
 
 [원하는 취약점 스타일]
 - 단순 나열이 아니라, '왜 취약한지'가 드러나게 문장형으로 작성
-- 아래 3가지를 섞어서 3~8개:
+- 아래 3가지를 섞어서 2~4개:
   1) 현재 상태에서 노리기 쉬운 취약점(예: 공포/불안이 지속 → 권위/긴급에 취약)
   2) 공격자가 피해야 할 자극(예: 분노 유발 금지/의심 촉발 금지/반감 유발 금지)
   3) 다음 단계로 유도할 때 유효한 방향(예: 확인 욕구/안전 욕구/상대 권위 수용)
+  - **각 항목은 50자 내외로 짧게. 긴 설명 금지**
 
 [출력 형식]
 - 오직 JSON 1개만
 - 키는 정확히 1개: "victim_vulnerabilities"
-- 값은 문자열 리스트(3~8개)
+- 값은 문자열 리스트(2~4개)
 
 [대화 로그]
 {dialog}
@@ -669,7 +670,7 @@ def _json_loads_lenient_full(s: str) -> Dict[str, Any]:
         vul = d.get("victim_vulnerabilities") or []
         if not isinstance(vul, list):
             vul = [str(vul)]
-        vul = [str(x) for x in vul][:6]
+        vul = [str(x) for x in vul][:4]
 
         cont = d.get("continue") or {}
         rec = cont.get("recommendation") or ("stop" if level == "critical" else "continue")
@@ -738,7 +739,7 @@ def _json_loads_lenient_vuln_only(s: str) -> Dict[str, Any]:
         if s:
             out.append(s)
 
-    return {"victim_vulnerabilities": out[:8]}
+    return {"victim_vulnerabilities": out[:4]}
 
 # =========================
 # 메인: 라운드별 전체대화 판정
@@ -826,7 +827,7 @@ def summarize_run_full(
     base_vul = parsed.get("victim_vulnerabilities") or []
     if not isinstance(base_vul, list):
         base_vul = [str(base_vul)]
-    base_vul = [str(x) for x in base_vul][:8]
+    base_vul = [str(x) for x in base_vul][:4]
     parsed["victim_vulnerabilities_base"] = base_vul
 
     # ✅ A안: risk.score 보정은 "emotion/HMM ON"이고 hmm_summary가 있을 때만 적용
@@ -886,7 +887,7 @@ def summarize_run_full(
             vuln_obj = _json_loads_lenient_vuln_only(resp_vuln)
             vv = vuln_obj.get("victim_vulnerabilities")
             if isinstance(vv, list):
-                hmm_vul = [str(x).strip() for x in vv if str(x).strip()][:8]
+                hmm_vul = [str(x).strip() for x in vv if str(x).strip()][:4]
         except Exception:
             hmm_vul = []
 
