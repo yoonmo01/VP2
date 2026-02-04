@@ -2118,15 +2118,6 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
     - inject_emotion==False: {{"data": {{"case_id": <3단계 case_id>, "run_no": 1, "turns": <3단계 turns>, "hmm": {{"available": false, "reason": "emotion_disabled", "run_no": 1}}}}}}
 - 저장: 판정 결과 (JUDGEMENT_R1)
 
-단계 4-1: 라운드1 종료 조건 체크
-  [A] risk.level == "critical"인가?
-      → YES: 즉시 단계 10으로 이동
-      → NO: 단계 4-2로
-      
-  [B] 현재 라운드 == {max_rounds}인가? (1 == {max_rounds}?)
-      → YES: 즉시 단계 10으로 이동
-      → NO: 단계 5로
-
 단계 5: 가이던스 생성 (라운드2용)
 - 도구: admin.generate_guidance
 - 입력: {{"data": {{"case_id": CASE_ID, "run_no": 1, "scenario": <1단계 scenario>, "victim_profile": <1단계 victim_profile>}}}}
@@ -2238,7 +2229,7 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
 초기화: 1 (엔티티 로드)
 
 라운드1:
-  2→3→4→4-1 체크: critical? NO, 1=={max_rounds}? NO → 5
+  2→3→4→5
 
 라운드2:
   6→7→8→8-1 체크: critical? NO, 2=={max_rounds}? NO → 9→6
