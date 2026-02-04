@@ -1311,7 +1311,7 @@ def _smart_print(*args, **kwargs):
         
         elif ("persisted" in data) and ("phishing" in data) and ("risk" in data):
             tag = "judgement"
-        elif ("type" in data) and ("text" in data) and (("categories" in data) or ("targets" in data)):
+        elif ("type" in data) and (("전략" in data) or ("수법" in data) or ("targets" in data)):
             tag = "guidance"
         elif ("personalized_prevention" in data):
             tag = "prevention"

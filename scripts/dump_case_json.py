@@ -53,9 +53,9 @@ USE_TAVILY = False       # 필요하면 True
 # JSON 저장 폴더 (상대경로 가능)
 DUMP_DIR = "C:/LIT_VP2/VP/scripts/case_json_0123"
 # ✅ 목표: 성공 JSON 몇 개 모을지
-TARGET_JSON = 5
+TARGET_JSON = 1
 # ✅ 안전장치: 최대 시도 횟수(너무 많이 실패하면 종료)
-MAX_ATTEMPTS = 500
+MAX_ATTEMPTS = 1
 # ✅ 시도 간 쉬기(레이트/서버 부하 완화)
 SLEEP_SEC = 0.2
 # =========================

@@ -1068,8 +1068,9 @@ def make_admin_tools(db: Session, guideline_repo):
         return {
             "ok": True,
             "type": "A",
-            "text": result.get("guidance_text", ""),
-            "categories": result.get("selected_categories", []),
+            "전략": result.get("전략", ""),
+            "수법": result.get("수법", ""),
+            "감정": result.get("감정", ""),
             "reasoning": result.get("reasoning", ""),
             "expected_effect": result.get("expected_effect", ""),
             "risk_level": (verdict.get("risk") or {}).get("level", ""),
