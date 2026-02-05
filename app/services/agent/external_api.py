@@ -905,3 +905,109 @@ def send_judgement_to_external(
             "round_no": round_no,
             "error": str(e),
         }
+
+
+# ─────────────────────────────────────────────────────────
+# 매 라운드 판정 후 무조건 웹 서치 시스템 호출
+# ─────────────────────────────────────────────────────────
+def send_to_websearch_every_round(
+    case_id: str,
+    round_no: int,
+    turns: List[Dict[str, Any]],
+    judgement: Dict[str, Any],
+    scenario: Optional[Dict[str, Any]] = None,
+    victim_profile: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    매 라운드 판정 후 무조건 VP-Web-Search 시스템에 전송
+
+    - 임계값 체크 없이 매번 호출
+    - 감정 라벨이 제거된 순수 대화 내용만 전송
+    - 판정 결과(phishing, risk, evidence 등) 포함
+
+    Args:
+        case_id: 케이스 ID
+        round_no: 라운드 번호
+        turns: 원본 대화 turns (감정 라벨 포함 가능)
+        judgement: 판정 결과
+        scenario: 시나리오 정보 (선택)
+        victim_profile: 피해자 프로필 (선택)
+
+    Returns:
+        전송 결과
+    """
+    logger.info(
+        "[WebSearch] 매 라운드 전송 시작: case=%s, round=%d",
+        case_id, round_no
+    )
+
+    # 1) 감정 라벨 제거
+    clean_turns = _strip_emotion_labels_from_turns(turns)
+
+    logger.info(
+        "[WebSearch] 감정 라벨 제거: 원본 %d턴 → 정제 %d턴",
+        len(turns), len(clean_turns)
+    )
+
+    # 2) 전송 payload 생성
+    payload = JudgementSendPayload(
+        case_id=str(case_id),
+        round_no=round_no,
+        turns=clean_turns,
+        judgement=judgement,
+        scenario=scenario,
+        victim_profile=victim_profile,
+    )
+
+    # 3) VP-Web-Search API 호출
+    try:
+        client = get_external_client()
+        url = f"{client.base_url}/api/v1/judgements"
+
+        logger.info(
+            "[WebSearch] 판정 전송 요청: case_id=%s, round=%d, turns=%d, url=%s",
+            case_id, round_no, len(clean_turns), url
+        )
+
+        with httpx.Client(timeout=client.timeout) as http_client:
+            response = http_client.post(
+                url,
+                json=payload.to_dict(),
+                headers=client._get_headers(),
+            )
+
+        if response.status_code == 200:
+            result = response.json()
+            logger.info(
+                "[WebSearch] 전송 성공! case_id=%s, round=%d, received_id=%s",
+                case_id, round_no, result.get("received_id", "")
+            )
+            return {
+                "ok": True,
+                "case_id": case_id,
+                "round_no": round_no,
+                "turns_sent": len(clean_turns),
+                "received_id": result.get("received_id"),
+                "response": result,
+            }
+        else:
+            logger.error(
+                "[WebSearch] 전송 실패: status=%d, body=%s",
+                response.status_code, response.text[:500]
+            )
+            return {
+                "ok": False,
+                "case_id": case_id,
+                "round_no": round_no,
+                "status_code": response.status_code,
+                "error": response.text[:500],
+            }
+
+    except Exception as e:
+        logger.exception("[WebSearch] 전송 예외")
+        return {
+            "ok": False,
+            "case_id": case_id,
+            "round_no": round_no,
+            "error": str(e),
+        }

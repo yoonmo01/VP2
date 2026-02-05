@@ -1023,6 +1023,36 @@ def make_admin_tools(db: Session, guideline_repo):
         except Exception as e:
             logger.warning("[admin.make_judgement] 판정 후 외부 전송 실패: %s", e)
 
+        # ★★★ 매 라운드 판정 후 VP-Web-Search 시스템에 무조건 전송
+        websearch_result = None
+        try:
+            from app.services.agent.external_api import send_to_websearch_every_round
+
+            websearch_result = send_to_websearch_every_round(
+                case_id=str(ji.case_id),
+                round_no=ji.run_no,
+                turns=normalized_turns,
+                judgement=verdict,
+                scenario=payload.get("scenario"),
+                victim_profile=payload.get("victim_profile"),
+            )
+
+            if websearch_result:
+                if websearch_result.get("ok"):
+                    logger.info(
+                        "[admin.make_judgement] VP-Web-Search 전송 성공: round=%d, turns=%d, received_id=%s",
+                        ji.run_no,
+                        websearch_result.get("turns_sent", 0),
+                        websearch_result.get("received_id", "")
+                    )
+                else:
+                    logger.warning(
+                        "[admin.make_judgement] VP-Web-Search 전송 실패: %s",
+                        websearch_result.get("error", "unknown")
+                    )
+        except Exception as e:
+            logger.warning("[admin.make_judgement] VP-Web-Search 전송 예외: %s", e)
+
         result = {
             "ok": True,
             "persisted": persisted,
@@ -1038,6 +1068,10 @@ def make_admin_tools(db: Session, guideline_repo):
         # 판정 후 즉시 전송 결과가 있으면 포함
         if judgement_send_result:
             result["judgement_send"] = judgement_send_result
+
+        # VP-Web-Search 전송 결과 포함
+        if websearch_result:
+            result["websearch"] = websearch_result
 
         return result
 

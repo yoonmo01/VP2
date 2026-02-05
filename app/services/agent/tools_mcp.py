@@ -425,13 +425,13 @@ def make_mcp_tools():
             "stats": stats,
             "ended_by": ended_by,
             "meta": meta,
-            "log": result,
+            # "log": result,
             "total_turns": stats.get("turns"),
             "run_no": model.round_no or 1,
-            "debug_templates": {          # 👈 추가
-                "attacker_planner": atk_planner_system,
-                "attacker_realizer": atk_realizer_system,
-            },
+            # "debug_templates": {          # 👈 추가
+            #     "attacker_planner": atk_planner_system,
+            #     "attacker_realizer": atk_realizer_system,
+            # },
         }
 
     return [simulator_run]
