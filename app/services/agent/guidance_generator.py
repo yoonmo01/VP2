@@ -14,6 +14,10 @@ from pydantic import BaseModel, Field
 from langchain_core.tools import tool
 
 from app.utils.ids import safe_uuid
+from app.services.agent.external_reports_store import (
+    get_latest_report_by_case,
+    get_techniques_by_case,
+)
 
 logger = get_logger(__name__)
 
@@ -107,6 +111,41 @@ H. 계좌동결 위협형: 범행계좌 연루 → 계좌 지급정지 위협 �
 """)])
 
 
+WEB_SEARCH_MERGE_START_ROUND = 4
+
+GUIDANCE_MERGE_PROMPT = ChatPromptTemplate.from_messages([
+    ("system", """
+당신은 보이스피싱 시뮬레이션 지침 통합 전문가입니다.
+
+[목표]
+- 기존 지침(원본)과 웹 서치 리포트(외부)를 함께 반영해 실제 사용 가능한 최종 지침 하나를 만든다.
+- 최종 결과는 반드시 전략(A~E) 1개, 수법(F~H) 1개만 선택한다.
+
+[출력 형식]
+반드시 아래 JSON만 출력:
+```json
+{{
+    "전략": "A",
+    "수법": "F",
+    "감정": "",
+    "reasoning": "원본 지침과 웹서치 내용을 어떻게 결합했는지",
+    "expected_effect": "결합 지침의 예상 효과"
+}}
+```
+"""),
+    ("human", """
+[원본 지침]
+{original_guidance}
+
+[외부 웹서치 최신 리포트]
+{external_report}
+
+[외부 웹서치 추천 수법(techniques)]
+{external_techniques}
+
+원본 지침의 의도를 유지하되, 웹서치 근거를 반영해 최종 지침으로 통합하세요.
+"""),
+])
 
 
 class DynamicGuidanceGenerator:
@@ -133,6 +172,7 @@ class DynamicGuidanceGenerator:
     ) -> Dict[str, Any]:
         """
         시나리오/피해자/이전판정/최근로그 + 판정결과(verdict)를 바탕으로 동적 지침을 생성.
+        웹서치 리포트가 있으면 원본 지침과 결합해 최종 지침을 생성.
         """
         # 1) case_id 정규화 및 최근 로그 조회
         u = safe_uuid(case_id)
@@ -155,8 +195,12 @@ class DynamicGuidanceGenerator:
         vulnerabilities = (verdict or {}).get("victim_vulnerabilities") or []
         evidence = (verdict or {}).get("evidence", "")
 
-        # 4) 프롬프트 입력 구성
-        prompt_input = {
+        # 3-1) 외부 웹서치 리포트(최근 수신본) 조회
+        external_report = get_latest_report_by_case(case_id) or {}
+        external_techniques = get_techniques_by_case(case_id)
+
+        # 4) 원본 지침 생성(웹서치 미반영)
+        original_prompt_input = {
             "scenario": json.dumps(scenario, ensure_ascii=False, indent=2),
             "victim_profile": json.dumps(victim_profile, ensure_ascii=False, indent=2),
             "round_no": round_no,
@@ -167,55 +211,56 @@ class DynamicGuidanceGenerator:
             "risk_score": risk_score,
             "phishing": phishing,
             "vulnerabilities": json.dumps(vulnerabilities, ensure_ascii=False),
-            "evidence": evidence[:600],  # 너무 긴 텍스트는 모델 성능 저해 → 제한
+            "evidence": evidence[:600],
         }
+        original_chain = GUIDANCE_GENERATOR_PROMPT | self.llm
+        original_response = original_chain.invoke(original_prompt_input)
+        original_content = getattr(original_response, "content", str(original_response))
+        original_parsed = self._normalize_guidance_output(self._safe_json(original_content))
 
-        # 5) LLM 호출
-        chain = GUIDANCE_GENERATOR_PROMPT | self.llm
-        response = chain.invoke(prompt_input)
-        content = getattr(response, "content", str(response))
+        # 5) 웹서치 병합 적용 여부 판단
+        has_external_data = bool(external_report) or bool(external_techniques)
+        use_merged_guidance = round_no >= WEB_SEARCH_MERGE_START_ROUND and has_external_data
 
-        # 6) JSON 파싱(코드펜스 허용)
-        parsed = self._safe_json(content)
+        merged_parsed = original_parsed
+        if use_merged_guidance:
+            merge_prompt_input = {
+                "original_guidance": json.dumps(original_parsed, ensure_ascii=False, indent=2),
+                "external_report": json.dumps(external_report, ensure_ascii=False, indent=2),
+                "external_techniques": json.dumps(external_techniques, ensure_ascii=False, indent=2),
+            }
+            merge_chain = GUIDANCE_MERGE_PROMPT | self.llm
+            merge_response = merge_chain.invoke(merge_prompt_input)
+            merge_content = getattr(merge_response, "content", str(merge_response))
+            merged_parsed = self._normalize_guidance_output(self._safe_json(merge_content))
 
-        # 7) 사후 검증/보정: 전략, 수법 각각 하나씩만
-        전략_raw = parsed.get("전략", "")
-        수법_raw = parsed.get("수법", "")
-        감정_raw = parsed.get("감정", "")
+        # 6) 기본값 보강 (실사용은 selected_guidance만 사용)
+        selected_guidance = merged_parsed if use_merged_guidance else original_parsed
+        selected_guidance.setdefault("reasoning", "원본 지침과 웹서치 리포트를 결합해 전략을 선택" if use_merged_guidance else "판정 결과와 최근 로그를 근거로 전략을 선택")
+        selected_guidance.setdefault("expected_effect", "의심 감소 및 즉시 행동 유도")
 
-        # 타입 정규화 (리스트로 들어오면 첫번째만, 문자열이면 그대로)
-        if isinstance(전략_raw, list):
-            전략_raw = 전략_raw[0] if 전략_raw else "A"
-        if isinstance(수법_raw, list):
-            수법_raw = 수법_raw[0] if 수법_raw else "F"
-        if isinstance(감정_raw, list):
-            감정_raw = 감정_raw[0] if 감정_raw else ""
+        # 7) 웹서치/원본/최종 통합 로깅
+        logger.info(
+            "[GuidanceMergeInputs] %s",
+            json.dumps(
+                {
+                    "case_id": str(u) if u else case_id,
+                    "round_no": round_no,
+                    "merge_start_round": WEB_SEARCH_MERGE_START_ROUND,
+                    "has_external_data": has_external_data,
+                    "use_merged_guidance": use_merged_guidance,
+                    "external_report": external_report,
+                    "external_techniques": external_techniques,
+                    "original_guidance": original_parsed,
+                    "merged_guidance": merged_parsed,
+                    "selected_guidance": selected_guidance,
+                },
+                ensure_ascii=False,
+            ),
+        )
 
-        전략_code = str(전략_raw).strip().upper()
-        수법_code = str(수법_raw).strip().upper()
-        감정_code = str(감정_raw).strip()
-
-        # 유효성 검증 및 기본값
-        if 전략_code not in STRATEGY_DEFINITIONS:
-            전략_code = "A"
-        if 수법_code not in METHOD_DEFINITIONS:
-            수법_code = "F"
-
-        # 알파벳 → 전체 텍스트로 변환
-        전략_text = f"{전략_code}. {STRATEGY_DEFINITIONS[전략_code]}"
-        수법_text = f"{수법_code}. {METHOD_DEFINITIONS[수법_code]}"
-        감정_text = 감정_code  # 추후 EMOTION_DEFINITIONS 추가 시 변환
-
-        parsed["전략"] = 전략_text
-        parsed["수법"] = 수법_text
-        parsed["감정"] = 감정_text
-
-        # 8) 기본값 보강
-        parsed.setdefault("reasoning", "판정 결과와 최근 로그를 근거로 전략을 선택")
-        parsed.setdefault("expected_effect", "의심 감소 및 즉시 행동 유도")
-
-        # 9) 로깅
-        self._log_guidance_generation(str(u) if u else "unknown", round_no, parsed, {
+        # 8) 상세 로그
+        self._log_guidance_generation(str(u) if u else "unknown", round_no, selected_guidance, {
             "scenario": scenario,
             "victim_profile": victim_profile,
             "previous_judgments": previous_judgments,
@@ -225,9 +270,16 @@ class DynamicGuidanceGenerator:
             "phishing": phishing,
             "vulnerabilities": vulnerabilities,
             "evidence": evidence[:600],
+            "external_report": external_report,
+            "external_techniques": external_techniques,
+            "original_guidance": original_parsed,
+            "merged_guidance": merged_parsed,
+            "selected_guidance": selected_guidance,
+            "use_merged_guidance": use_merged_guidance,
+            "merge_start_round": WEB_SEARCH_MERGE_START_ROUND,
         })
 
-        return parsed
+        return selected_guidance
 
     # ── helpers ───────────────────────────────────────────
     def _get_recent_logs(self, db: Session, case_id: str, round_no: int, *, limit: int = 5) -> List[Dict[str, Any]]:
@@ -265,6 +317,33 @@ class DynamicGuidanceGenerator:
             logger.warning("[GuidanceGenerator] 로그 조회 실패: %s", e)
             return []
 
+    def _normalize_guidance_output(self, parsed: Dict[str, Any]) -> Dict[str, Any]:
+        """전략/수법/감정 출력을 표준 포맷으로 정규화."""
+        전략_raw = parsed.get("전략", "")
+        수법_raw = parsed.get("수법", "")
+        감정_raw = parsed.get("감정", "")
+
+        if isinstance(전략_raw, list):
+            전략_raw = 전략_raw[0] if 전략_raw else "A"
+        if isinstance(수법_raw, list):
+            수법_raw = 수법_raw[0] if 수법_raw else "F"
+        if isinstance(감정_raw, list):
+            감정_raw = 감정_raw[0] if 감정_raw else ""
+
+        전략_code = str(전략_raw).strip().upper()
+        수법_code = str(수법_raw).strip().upper()
+        감정_code = str(감정_raw).strip()
+
+        if 전략_code not in STRATEGY_DEFINITIONS:
+            전략_code = "A"
+        if 수법_code not in METHOD_DEFINITIONS:
+            수법_code = "F"
+
+        parsed["전략"] = f"{전략_code}. {STRATEGY_DEFINITIONS[전략_code]}"
+        parsed["수법"] = f"{수법_code}. {METHOD_DEFINITIONS[수법_code]}"
+        parsed["감정"] = 감정_code
+        return parsed
+
     def _log_guidance_generation(self, case_id: str, round_no: int, result: Dict[str, Any], context: Dict[str, Any]):
         """지침 생성 과정을 상세히 로깅(안전하게)."""
         try:
@@ -288,6 +367,13 @@ class DynamicGuidanceGenerator:
                     "risk_score": context.get("risk_score"),
                     "phishing": context.get("phishing"),
                     "vulnerabilities": context.get("vulnerabilities"),
+                    "external_report": context.get("external_report", {}),
+                    "external_techniques": context.get("external_techniques", []),
+                    "original_guidance": context.get("original_guidance", {}),
+                    "merged_guidance": context.get("merged_guidance", {}),
+                    "selected_guidance": context.get("selected_guidance", {}),
+                    "use_merged_guidance": context.get("use_merged_guidance", False),
+                    "merge_start_round": context.get("merge_start_round"),
                 }
             }
             logger.info("[GuidanceGeneration] %s", json.dumps(log_data, ensure_ascii=False))
