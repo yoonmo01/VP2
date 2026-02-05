@@ -2158,7 +2158,9 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
 단계 8-1: 라운드N 종료 조건 체크 ← **매우 중요**
   
   [체크 A] risk.level == "critical"인가?
-      → YES: **즉시 단계 10으로 이동** (라운드 수 무관)
+      → YES:
+          - N < 2 이면: **종료 금지** (최소 2라운드 보장) → 단계 9로 진행
+          - N >= 2 이면: **즉시 단계 10으로 이동**
       → NO: 체크 B로
   
   [체크 B] N == {max_rounds}인가?
@@ -2167,7 +2169,8 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
       → NO: 단계 9로 (다음 라운드 준비)
 
 단계 9: 가이던스 생성 (다음 라운드용)
-- **진입 조건**: N < {max_rounds} AND risk.level != "critical"
+- **진입 조건**:
+  - N < {max_rounds} AND (risk.level != "critical" OR N < 2)
 - 도구: admin.generate_guidance
 - 입력: {{"data": {{"case_id": CASE_ID, "run_no": N, "scenario": <1단계 scenario>, "victim_profile": <1단계 victim_profile>}}}}
 - 저장: GUIDANCE_R{{N+1}}
@@ -2872,7 +2875,8 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
             last_judgement = judgements_history[-1] if judgements_history else {}
             risk_lvl = (last_judgement.get("risk", {}).get("level") or "").lower()
 
-            if risk_lvl == "critical":
+            # 최소 2라운드 보장: 라운드1 critical은 종료 사유로 치지 않음
+            if risk_lvl == "critical" and rounds_done >= 2:
                 finished_reason = "critical"
             elif rounds_done >= max_rounds:
                 finished_reason = "max_rounds"
