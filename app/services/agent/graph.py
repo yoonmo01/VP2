@@ -5,7 +5,7 @@ from copy import deepcopy
 
 MIN_ROUNDS = 2
 MAX_ROUNDS = 5
-MAX_TURNS_PER_ROUND = 15  # (공1+피1을 1턴으로 본 정의에 맞춰 시뮬 엔진이 동일 의미로 해석)
+MAX_TURNS_PER_ROUND = 20  # (공1+피1을 1턴으로 본 정의에 맞춰 시뮬 엔진이 동일 의미로 해석)
 
 def should_continue_rounds(last_judgement: Dict[str, Any], round_index: int) -> bool:
     # 최소 2회는 돌고, 피해자가 충분히 방어할 수 있다고 판단되면 조기 중단

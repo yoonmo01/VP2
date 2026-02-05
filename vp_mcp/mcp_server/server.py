@@ -2,6 +2,7 @@
 from __future__ import annotations
 import os
 import uvicorn
+from typing import cast
 from dotenv import load_dotenv
 from pathlib import Path
 from fastapi import FastAPI, HTTPException, Query
@@ -85,9 +86,19 @@ def build_app():
                 # ✅ 통짜 프롬프트/템플릿 → attacker/victim.system 주입
                 normalized = _coerce_input_legacy(args) if _coerce_input_legacy else args
 
+                # ✅ 핵심: templates는 스키마에서 드랍될 수 있으니 validate "전"에 보관
+                raw_templates = {}
+                if isinstance(normalized, dict) and isinstance(normalized.get("templates"), dict):
+                    raw_templates = cast(Dict[str, Any], normalized.get("templates") or {})
+
                 def _run_sync() -> dict:
                     model = SIM_SCHEMA.model_validate(normalized)
-                    return SIM_IMPL(model)
+                    # ✅ templates를 impl로 전달 (2-call planner/realizer 분리의 핵심)
+                    try:
+                        return SIM_IMPL(model, templates=raw_templates)
+                    except TypeError:
+                        # 혹시 impl 시그니처가 templates를 안 받는 빌드면 하위호환
+                        return SIM_IMPL(model)
                 return await anyio.to_thread.run_sync(_run_sync)
 
             raise HTTPException(

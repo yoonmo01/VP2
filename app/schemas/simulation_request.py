@@ -82,7 +82,7 @@ class SimulationStartRequest(BaseModel):
 
     # 공통 옵션
     use_tavily: bool = False                    # 커스텀 시나리오일 때만 사용 권장
-    max_turns: int = Field(default=15, ge=1, le=30)
+    max_turns: int = Field(default=20, ge=1, le=30)
 
     # 🔧 라운드/케이스 제어
     round_limit: Optional[int] = 5              # 오케스트레이터가 2~5로 클램프

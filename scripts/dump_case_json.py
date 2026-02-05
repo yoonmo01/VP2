@@ -46,7 +46,7 @@ from app.services.agent.orchestrator_react import run_orchestrated, _ensure_stre
 OFFENDER_ID = 4          # 피싱범 id
 VICTIM_ID = 1            # 피해자 id
 
-MAX_TURNS = 15           # 한 라운드 최대 턴 수 (피싱범+피해자 교환 포함 구조면 orchestrator 기준에 맞춰 유지)
+MAX_TURNS = 20           # 한 라운드 최대 턴 수 (피싱범+피해자 교환 포함 구조면 orchestrator 기준에 맞춰 유지)
 ROUND_LIMIT = 5          # UI 제한(max 3) 걸려있으면 3 이하로
 USE_TAVILY = False       # 필요하면 True
 

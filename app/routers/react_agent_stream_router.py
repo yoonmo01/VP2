@@ -21,7 +21,7 @@ async def simulate_stream(
     request: Request,
     offender_id: int,
     victim_id: int,
-    max_turns: int = 15,
+    max_turns: int = 20,
     round_limit: int = Query(3, ge=2, le=3),
     case_id: Optional[str] = None,
     use_tavily: bool = False,

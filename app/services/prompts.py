@@ -500,7 +500,19 @@ def render_victim_system_string(
 - 직전 공격자 발화가 **JSON처럼 보이는 경우**, 그 안의 **"utterance"** 필드만 실제 발화로 간주한다.
 - "intent" / "action_requested" / "safety_flags" 등의 메타 값은 **절대 대화 내용으로 사용하지 않는다**.
 - JSON이 아니면 해당 텍스트 전체를 실제 발화로 간주한다.
-- 실제 개인정보/실제 계좌/전화번호는 절대 말하지 않으며, 필요 시 [PLACEHOLDER] 로 표현한다.
+- [PLACEHOLDER] 같은 토큰을 대화에 직접 출력하지 않는다.
+- 실제 개인정보/실제 계좌/전화번호/상세주소는 절대 말하지 않으며, 필요 시 아래 "부분 마스킹" 표기로만 표현한다.
+
+[부분 마스킹 표기 규칙(강제)]
+- 기관명(예: 검찰청/경찰청/금융감독원/은행명 등)은 그대로 표기 가능(실존 기관이어도 OK).
+- 인물 "실명"은 부분 마스킹으로만 표기:
+  - 예: "양**", "김*수"
+- 전화번호는 형식 유지 + 중간 마스킹:
+  - 예: "010-****-1234", "02-***-7890"
+- 계좌번호는 앞/뒤 일부만 남기고 가운데 마스킹:
+  - 예: "123-****-****-789", "110-2****-****"
+- 주소는 행정구역만 남기고 상세는 마스킹:
+  - 예: "서울 ○○구 ○○로 **", "대전 ○○구 **"
 
 
 [응답 규칙]
@@ -674,7 +686,7 @@ ATTACKER_PROMPT_V2_SYSTEM = dedent("""
 {{
     "utterance": "<한국어 2~4문장, 350자 이내, 한 단락>",
     "proc_code": "<아래 절차 목록 중 하나(예: 1-1)>",
-    "ppse_labels": ["<PPSE 코드 1~3개>"]
+    "ppse_labels": ["<PPSE 코드 1개>"]
 }}
 
 종료 조건이면, 정확히 한 줄만 출력하고 종료:
@@ -760,20 +772,38 @@ ATTACKER_PROC_PLANNER_V2_SYSTEM = dedent("""
 너는 보이스피싱(검경/수사관 사칭) 시나리오를 “방어/연구 목적”으로 생성하기 위한
 '절차 선택기(Planner)'이다.
 목표는 직전 대화(특히 직전 피해자 발화)를 보고, 아래 절차 목록 중
-다음 공격자 턴에 해당하는 proc_code를 "딱 하나" 선택하는 것이다.
+다음 공격자 턴에 해당하는 proc_code를 "딱 하나" 선택하고,
+그 proc_code에 해당하는 절차 전문(proc_text)을 절차 목록에서 "그대로 복사"하여 함께 출력하는 것이다.
+
+[중요 — 역할 분리: 종료 판단은 Planner가 담당]
+- 종료 조건(피해자 종료 신호 / 최근 2턴 카운트형 종결 조건 등)을 여기서 판단한다.
+- 종료해야 한다고 판단되면, 아래 출력 형식에 따라 action="END"로 출력한다.
 
 [중요 — 출력 형식]
 종료 조건이 아니면, 반드시 JSON 1개만 출력:
-{"proc_code": "<절차 목록 중 하나>"}
+{
+    "action": "CONTINUE",
+    "proc_code": "<절차 목록 중 하나>",
+    "proc_text": "<아래 절차 목록에서 해당 proc_code 라인의 '설명 전문'을 그대로 복사한 문자열>"
+}
+
+종료 조건이면, 반드시 JSON 1개만 출력:
+{"action": "END"}
+
+✅ [proc_text 복사 규칙(강제)]
+- proc_text는 절차 목록(PROCEDURE_LIST_KO)에 이미 정의된 문장을 그대로 복사한다.
+- 요약/의역/확장/추가 설명/표현 변경은 절대 금지(띄어쓰기/구두점 포함 가능한 한 원문 유지).
+- 절차 목록에 없는 문장이나 새 문장 발명 금지.
+- proc_code와 proc_text는 반드시 서로 매칭되어야 한다.
+- 예: proc_code가 "2-2"면, proc_text는 "2-2 ..."로 시작하는 해당 줄의 전문을 그대로 넣는다.
 
 ✅ [첫 턴 예외 규칙(강제)]
 - 만약 [직전 대화] 블록이 "직전 대화 없음." 이라면(=대화 시작 / 이전 발화 없음),
-    proc_code는 반드시 아래 JSON으로 고정 출력한다:
-    {"proc_code": "1-1"}
+    proc_code/proc_text를 반드시 아래 JSON으로 고정 출력한다:
+    {"action":"CONTINUE","proc_code":"1-1","proc_text":"1-1 기망 대상 확인-(1) 전화 상대방 본인 여부 확인"}
 - 이 경우에도 다른 키/설명/코드펜스 없이 JSON 한 개만 출력한다.
 
-종료 조건이면, 정확히 한 줄만 출력하고 종료:
-"여기서 마무리하겠습니다."
+⚠️ 주의: Planner는 종료 시 "한 줄 문자열"이 아니라 반드시 {"action":"END"} JSON을 출력한다.
 
 [피해자 발화 해석(강제)]
 - 직전 피해자 발화가 JSON처럼 보이면 dialogue 필드만 실제 발화로 간주한다.
@@ -793,6 +823,10 @@ ATTACKER_PROC_PLANNER_V2_SYSTEM = dedent("""
 (B) 신고/차단/대표번호 확인/지점 방문 의사
 (D) 제3자(은행/가족/경찰/지인)에게 확인/상담 의사
 (E) 2턴 연속 의미 있는 진전 없음
+
+[출력 제약(강제)]
+- action이 "END"이면 proc_code/proc_text를 절대 포함하지 않는다.
+- action이 "CONTINUE"이면 proc_code/proc_text를 반드시 포함한다.
 
 [절차 선택 규칙]
 - 매 턴, proc_code는 하나만 선택한다.
@@ -815,14 +849,14 @@ ATTACKER_PROC_PLANNER_V2 = ChatPromptTemplate.from_messages([
     ("system", ATTACKER_PROC_PLANNER_V2_SYSTEM),
     MessagesPlaceholder("history"),
     ("human", """
-다음 정보를 참고하여 **다음 proc_code**를 선택하라.
+다음 정보를 참고하여 **다음 proc_code**를 선택하고,
+그에 해당하는 **proc_text(절차 전문)**을 절차 목록에서 그대로 복사하여 함께 출력하라.
 
 [직전 대화]
 {previous_turns_block}
 
 **유효 JSON 한 개만 출력하세요.**
-단, 위 **종료 규칙**을 충족하면 JSON 대신 **정확히 한 줄**
-"여기서 마무리하겠습니다."만 출력하고 즉시 종료합니다.
+종료 조건이면 반드시 {"action":"END"} JSON으로 출력하세요. 한 줄 문자열 출력 금지.
 """)
 ])
 
@@ -832,62 +866,62 @@ ATTACKER_REALIZER_V2_SYSTEM = dedent("""
 너는 보이스피싱(검경/수사관 사칭) 시나리오를 “방어/연구 목적”으로 생성하는
 '발화 생성기(Realizer)'이다.
 
-목표는 입력으로 주어진 proc_code를 절대 변경하지 않고,
-그 proc_code에 해당하는 내용만으로 다음 공격자 발화 1턴(utterance)을 생성하며,
-PPSE 라벨(ppse_labels)을 1~3개 붙이는 것이다.
+목표는 입력으로 주어진 action을 따르며,
+action="END"이면 즉시 종료 문구만 출력하고,
+action="CONTINUE"이면 입력으로 주어진 proc_code를 절대 변경하지 않고
+proc_text(절차 전문) 범위 안에서만 다음 공격자 발화 1턴(utterance)을 생성하고,
+PPSE 라벨(ppse_labels)을 정확히 1개만 선택해 붙이는 것이다.
 
 [중요 — proc_code 고정]
 - 너는 아래에 제공되는 proc_code를 "그대로" 출력해야 한다.
-- proc_code가 가리키는 절차 범위 밖 내용(다른 단계 요소)을 절대 섞지 않는다.
+- proc_text에 적힌 절차 범위 밖 내용(다른 단계 요소)을 절대 섞지 않는다.
+- proc_text는 이미 정의된 절차 전문이므로, Realizer는 절차를 "선택/정의"하지 않는다(생성 금지).
+
+[민감정보 표기 규칙(강제)]
+- [PLACEHOLDER] 같은 토큰을 대화에 직접 출력하지 않는다.
+- 기관명(예: 검찰청/경찰청/금융감독원/은행명 등)은 그대로 표기 가능(실존 기관이어도 OK).
+- 인물 "실명"은 부분 마스킹으로만 표기:
+  - 예: "양**", "김*수"
+- 전화번호는 형식 유지 + 중간 마스킹:
+  - 예: "010-****-1234", "02-***-7890"
+- 계좌번호는 앞/뒤 일부만 남기고 가운데 마스킹:
+  - 예: "123-****-****-789", "110-2****-****"
+- 주소는 행정구역만 남기고 상세는 마스킹:
+  - 예: "서울 ○○구 ○○로 **", "대전 ○○구 **"
+
+[종료 처리(강제)]
+- action이 "END"이면, 정확히 한 줄로만 아래 문구를 출력하고 즉시 종료한다(그 외 출력 금지):
+  "여기서 마무리하겠습니다."
+- action이 "END"일 때는 JSON 출력 금지.
 
 [출력 형식 — 반드시 준수]
-종료 조건이 아니면, 아래 JSON 1개만 출력(추가 텍스트 금지):
+action="CONTINUE"일 때만, 아래 JSON 1개만 출력(추가 텍스트 금지):
 {
     "utterance": "<한국어 1~2문장, 220자 내외, 한 단락>",
     "proc_code": "<입력으로 받은 proc_code와 정확히 동일>",
-    "ppse_labels": ["<PPSE 코드 1~3개>"]
+    "ppse_labels": ["<PPSE 코드 1개>"]
 }
 
-종료 조건이면, 정확히 한 줄만 출력하고 종료:
-"여기서 마무리하겠습니다."
+[역할 분리]
+- 종료 판단은 Planner/서버가 수행한다. Realizer는 action을 그대로 따른다.
 
-[무해화 규칙]
-- 설득력/압박/실행 유도 최소화(교육용).
-- 금전/송금/앱설치/계좌/개인정보 제공을 실제로 유도하거나 구체 지시하지 않는다.
-- 필요한 고유명사는 [PLACEHOLDER].
-
-[피해자 발화 해석(강제)]
-- 직전 피해자 발화가 JSON처럼 보이면 dialogue 필드만 실제 발화로 간주한다.
-- thoughts, is_convinced 등 메타는 절대 사용하지 않는다.
-
-[종료 규칙(Planner와 동일)]
-피해자 발화에 아래가 포함되면 즉시 종료 문구만 출력:
-- "대화를 종료"
-- "전화(를) 끊"
-- "더 이상 (대화|통화) 원치"
-- "필요 없습니다" / "관심 없습니다"
-- "그만하시죠"
-
-최근 2턴 내에 아래 2개 이상이면 종료:
-(A) 사기/보이스피싱이라고 명시
-(B) 신고/차단/대표번호 확인/지점 방문 의사
-(D) 제3자(은행/가족/경찰/지인)에게 확인/상담 의사
-(E) 2턴 연속 의미 있는 진전 없음
-
-[N1 사용 규칙]
-- 발화가 주로 절차 안내/정보 전달이고 설득 기능이 거의 없으면 N1 단독:
-    "ppse_labels": ["N1"]
-- 설득 기능(A/C/D/S)이 뚜렷하면 N1 금지, A/C/D/S에서 1~3개.
+[PPSE 1개 선택 규칙(강제)]
+- ppse_labels는 **반드시 길이 1**인 배열이어야 한다. (예: ["A1"])
+- 아래 우선순위로 1개만 선택한다:
+  1) 발화가 주로 절차/정보 전달이고 설득 기능이 거의 없으면 → "N1"
+  2) 권위/기관 사칭/권한 주장/불이익 암시가 핵심이면 → A계열 중 1개
+  3) 시간 압박/긴급성/감정 고조/정보 과부하가 핵심이면 → D계열 중 1개
+  4) 호의/의무/일관성 압박이 핵심이면 → C계열 중 1개
+  5) 사회적 동조/공동 책임/규범 압박이 핵심이면 → S계열 중 1개
+- 절대 2개 이상을 넣지 않는다.
 
 [자기검증(내부)]
-- 작성한 utterance에 다른 proc_code 요소가 섞였다고 판단되면,
-    같은 proc_code 범위로 다시 짧게 고쳐서 출력한다.
+- 작성한 utterance가 proc_text 범위를 벗어났다고 판단되면,
+  proc_text 범위로 다시 짧게 고쳐서 출력한다.
 """).strip()
 
 ATTACKER_REALIZER_V2_SYSTEM = "\n".join([
     ATTACKER_REALIZER_V2_SYSTEM,
-    "",
-    PROCEDURE_LIST_KO,
     "",
     "[PPSE 라벨 정의(영어 원문 그대로)]",
     PPSE_LABELS_EN,
@@ -899,14 +933,20 @@ ATTACKER_REALIZER_V2 = ChatPromptTemplate.from_messages([
     ("human", """
 다음 정보를 참고하여 **다음 공격자 턴**을 생성하라.
 
+[planner_action]
+{action}
+
 [고정 proc_code]
 {proc_code}
+
+[고정 proc_text(절차 전문)]
+{proc_text}
 
 [직전 대화]
 {previous_turns_block}
 
 **유효 JSON 한 개만 출력하세요.**
-단, 위 **종료 규칙**을 충족하면 JSON 대신 **정확히 한 줄**
+단, action이 "END"이면 JSON 대신 **정확히 한 줄**
 "여기서 마무리하겠습니다."만 출력하고 즉시 종료합니다.
 """)
 ])
@@ -921,13 +961,20 @@ def build_proc_planner_inputs_v2(previous_turns: list[dict], scenario: dict | No
     previous_turns_block = "\n".join(prev_lines) if prev_lines else "직전 대화 없음."
     return {"previous_turns_block": previous_turns_block}
 
-def build_realizer_inputs_v2(previous_turns: list[dict], proc_code: str) -> dict:
+def build_realizer_inputs_v2(previous_turns: list[dict], proc_code: str, proc_text: str = "") -> dict:
     prev_lines = [
         f"[{t.get('role','?')}] {t.get('text','').replace(chr(10), ' ')}"
         for t in (previous_turns or [])
     ]
     previous_turns_block = "\n".join(prev_lines) if prev_lines else "직전 대화 없음."
-    return {"previous_turns_block": previous_turns_block, "proc_code": proc_code}
+    # action은 상위 로직(Planner/서버)이 결정하여 주입한다.
+    # 기본값은 CONTINUE로 두어 기존 호출부가 즉시 깨지지 않게 한다.
+    return {
+        "previous_turns_block": previous_turns_block,
+        "action": "CONTINUE",
+        "proc_code": proc_code,
+        "proc_text": proc_text,
+    }
 
 def build_data_prompt_inputs_v2(SCENARIO: dict, previous_turns: list[dict]) -> dict:
     """

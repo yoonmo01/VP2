@@ -15,7 +15,7 @@ class SimulationInput(BaseModel):
     # app의 prompt builder가 채워서 보냄
     attacker: RolePrompt
     victim: RolePrompt
-    max_turns: int = Field(default=15, ge=1, le=30)
+    max_turns: int = Field(default=20, ge=1, le=30)
 
     # 이어달리기/지침
     case_id_override: Optional[str] = None

@@ -9,6 +9,8 @@ from ..db.models import Conversation, TurnLog
 import json
 import re
 from typing import Tuple
+import hashlib
+
 
 # FastMCP 등록용
 from mcp.server.fastmcp import FastMCP
@@ -21,17 +23,31 @@ from vp_mcp.mcp_server.utils.end_rules import (
     VICTIM_FINAL_JSON,          # 피해자 마지막 고정 JSON
 )
 
-# ✅ 2-call에서 Planner 출력(proc_code) 파싱용
-def _extract_proc_code(planner_raw: str) -> Optional[str]:
+# ✅ 2-call에서 Planner 출력(proc_code + proc_text) 파싱용
+def _extract_proc_bundle(planner_raw: str) -> tuple[Optional[str], str]:
     t = _strip_code_fences(planner_raw or "")
     if attacker_declared_end(t):
-        return None
+        return (None, "")
     obj = _try_extract_first_json_obj(t)
     if isinstance(obj, dict):
         pc = obj.get("proc_code")
-        if isinstance(pc, str) and pc.strip():
-            return pc.strip()
-    return None
+        proc_code = pc.strip() if isinstance(pc, str) and pc.strip() else None
+
+        # planner가 함께 내주길 원하는 "절차 전문" 필드
+        # (planner 프롬프트에서 proc_text로 통일하는 걸 권장)
+        pt = (
+            obj.get("proc_text")
+            or obj.get("proc_label_text")
+            or obj.get("procedure_text")
+            or obj.get("label_text")
+            or ""
+        )
+        proc_text = pt.strip() if isinstance(pt, str) else ""
+        return (proc_code, proc_text)
+    return (None, "")
+
+def _debug_head(s: str, n: int = 140) -> str:
+    return ((s or "")[:n]).replace("\n", " ")
 
 def _build_previous_turns_block(turns: List[Turn]) -> str:
     lines = []
@@ -383,11 +399,13 @@ def simulate_dialogue_impl(input_obj: SimulationInput, *, templates: Optional[Di
             is_first_offender_turn = (turn_index == 0 and len(turns) == 0 and previous_turns_block == "직전 대화 없음.")
 
             if is_first_offender_turn:
+                # 첫 턴은 안정적으로 고정 (planner를 첫턴부터 돌리고 싶으면 여기 분기를 제거해도 됨)
                 proc_code = "1-1"
+                proc_text = ""  # ✅ realizer 시스템에서 절차 전문을 뺄 거면, 여기도 채우는 게 좋음(아래 NOTE 참고)
                 attacker_text = atk_realizer.next(
                     history=history_attacker,
                     last_victim=last_victim_dialogue,
-                    current_step="",
+                    current_step=proc_text,
                     guidance=guidance_text,
                     guidance_type=guidance_type,
                     previous_turns_block=previous_turns_block,
@@ -409,13 +427,17 @@ def simulate_dialogue_impl(input_obj: SimulationInput, *, templates: Optional[Di
                 if attacker_declared_end(planner_raw or ""):
                     attacker_text = ATTACKER_TRIGGER_PHRASE
                 else:
-                    proc_code = _extract_proc_code(planner_raw or "") or ""
+                    proc_code, proc_text = _extract_proc_bundle(planner_raw or "")
+                    proc_code = proc_code or ""
+                    proc_text = proc_text or ""
+
+
 
                     # (2) Realizer call (proc_code 고정)
                     attacker_text = atk_realizer.next(
                         history=history_attacker,
                         last_victim=last_victim_dialogue,
-                        current_step="",
+                        current_step=proc_text,
                         guidance=guidance_text,
                         guidance_type=guidance_type,
                         previous_turns_block=previous_turns_block,
