@@ -1104,11 +1104,73 @@ def make_admin_tools(db: Session, guideline_repo):
             logger.exception("[admin.generate_guidance] 실패")
             return {"ok": False, "error": f"generator_failed: {e!s}"}
 
+        # LLM으로 간결한 text 생성 (한 두 줄)
+        전략_raw = result.get("전략", "")
+        수법_raw = result.get("수법", "")
+        reasoning = result.get("reasoning", "")
+
+        # 전략 코드 추출
+        전략_code = 전략_raw.split(".")[0].strip() if 전략_raw else "A"
+
+        # LLM으로 간결 요약 생성
+        try:
+            from app.services.llm_providers import agent_chat
+            summarize_llm = agent_chat(temperature=0.3)
+
+            victim_meta = (victim_profile or {}).get("meta", {})
+            victim_traits = ((victim_profile or {}).get("traits", {}) or {})
+            ocean = (victim_traits.get("ocean") or {})
+            vnotes = (victim_traits.get("vulnerability_notes") or [])
+            knowledge = ((victim_profile or {}).get("knowledge", {}) or {})
+            k_notes = (knowledge.get("comparative_notes") or [])
+
+            summarize_prompt = f"""
+        너는 보이스피싱 시뮬레이션용 '공격자 지침 문장'을 만드는 편집자다.
+        아래 [reasoning]은 길고 설명적이므로, 핵심만 압축해 "수법(행동지침)" 문장 안에 반드시 녹여라.
+
+        목표:
+        - 출력은 반드시 1~2문장, 150자 이내.
+        - 단순 요약 금지. reasoning에서 뽑은 핵심(피해자 특성 기반 이유/압박 포인트)을 "행동지침"으로 재구성.
+        - 주민번호/계좌비번처럼 노골적 요구는 피하고, '공식 절차/근거/법적 책임' 같은 심리 압박을 자연스럽게 포함.
+        - 형식: "{전략_code}. 수법명: 구체 행동지침(why가 포함된 형태)"
+
+        입력:
+        [피해자 메타] age={victim_meta.get("age")} gender={victim_meta.get("gender")} edu={victim_meta.get("education")}
+        [피해자 지식] {k_notes}
+        [성격(OCEAN)] {ocean}
+        [취약 노트] {vnotes}
+
+        [전략] {전략_raw}
+        [수법] {수법_raw}
+        [reasoning] {reasoning}
+
+        출력 제약:
+        - JSON/코드블록/따옴표 없이 문장만 출력
+        - "왜(근거)"를 한 덩어리로 짧게 포함 (예: "확인욕구를 충족시키고 처벌 우려로 즉시 협조를 유도")
+        """
+
+            summary_response = summarize_llm.invoke(summarize_prompt)
+            text_brief = getattr(summary_response, "content", str(summary_response)).strip()
+
+            # 너무 길면 자르기
+            if len(text_brief) > 150:
+                text_brief = text_brief[:147] + "..."
+
+        except Exception as e:
+            logger.warning(f"[admin.generate_guidance] 요약 생성 실패: {e}")
+            # fallback: 수법 이름만 추출
+            수법_name = ""
+            if 수법_raw and "." in 수법_raw:
+                after_code = 수법_raw.split(".", 1)[1] if "." in 수법_raw else 수법_raw
+                수법_name = after_code.split(":")[0].strip() if ":" in after_code else after_code.strip()
+            text_brief = f"{전략_code}. {수법_name}" if 수법_name else 전략_code
+
         return {
             "ok": True,
-            "type": "A",
-            "전략": result.get("전략", ""),
-            "수법": result.get("수법", ""),
+            "type": 전략_code,
+            "text": text_brief,
+            "전략": 전략_raw,
+            "수법": 수법_raw,
             "감정": result.get("감정", ""),
             "reasoning": result.get("reasoning", ""),
             "expected_effect": result.get("expected_effect", ""),
