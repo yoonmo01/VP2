@@ -3,7 +3,9 @@ from __future__ import annotations
 from datetime import datetime
 import time
 from typing import Any, Dict, List, Optional
+import logging
 
+logger = logging.getLogger(__name__)
 
 # Webhook 수신 리포트 메모리 저장소
 _received_reports: Dict[str, Dict[str, Any]] = {}
@@ -12,6 +14,8 @@ _received_reports: Dict[str, Dict[str, Any]] = {}
 def save_received_report(analysis_id: str, report: Dict[str, Any]) -> None:
     """analysis_id 기준으로 수신 리포트를 저장/갱신한다."""
     _received_reports[analysis_id] = report
+    case_id = report.get("case_id", "unknown")
+    logger.info(f"[ExternalReportsStore] 저장 완료: analysis_id={analysis_id}, case_id={case_id}, 총 {len(_received_reports)}건")
 
 
 def get_received_report(analysis_id: str) -> Optional[Dict[str, Any]]:
@@ -32,6 +36,7 @@ def get_reports_by_case(case_id: str) -> List[Dict[str, Any]]:
 def get_latest_report_by_case(case_id: str) -> Optional[Dict[str, Any]]:
     """case_id 기준 최신 리포트 1건을 조회한다."""
     results = get_reports_by_case(case_id)
+    logger.debug(f"[ExternalReportsStore] 조회: case_id={case_id}, 결과={len(results)}건, 전체저장소={len(_received_reports)}건")
     if not results:
         return None
 

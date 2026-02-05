@@ -1001,85 +1001,7 @@ def make_admin_tools(db: Session, guideline_repo):
         except Exception as e:
             logger.warning("[admin.make_judgement] 판정 후 외부 전송 실패: %s", e)
 
-        # ★★★ 매 라운드 판정 후 VP-Web-Search 시스템에 무조건 전송
-        websearch_result = None
-        prev_websearch_analysis_id = None
-        try:
-            from app.services.agent.external_api import send_to_websearch_every_round
-            from app.services.agent.external_reports_store import get_latest_report_by_case
-
-            prev_latest_report = get_latest_report_by_case(str(ji.case_id)) or {}
-            prev_websearch_analysis_id = prev_latest_report.get("analysis_id")
-
-            websearch_result = send_to_websearch_every_round(
-                case_id=str(ji.case_id),
-                round_no=ji.run_no,
-                turns=normalized_turns,
-                judgement=verdict,
-                scenario=payload.get("scenario"),
-                victim_profile=payload.get("victim_profile"),
-            )
-
-            if websearch_result:
-                if websearch_result.get("ok"):
-                    logger.info(
-                        "[admin.make_judgement] VP-Web-Search 전송 성공: round=%d, turns=%d, received_id=%s",
-                        ji.run_no,
-                        websearch_result.get("turns_sent", 0),
-                        websearch_result.get("received_id", "")
-                    )
-                else:
-                    logger.warning(
-                        "[admin.make_judgement] VP-Web-Search 전송 실패: %s",
-                        websearch_result.get("error", "unknown")
-                    )
-        except Exception as e:
-            logger.warning("[admin.make_judgement] VP-Web-Search 전송 예외: %s", e)
-
-        # ★★★★ 웹서치 리포트 수신 대기(가이던스 생성 전에 반영되도록 짧게 블로킹)
-        websearch_report_wait = None
-        if websearch_result and websearch_result.get("ok"):
-            try:
-                from app.services.agent.external_reports_store import (
-                    get_latest_report_by_case,
-                    wait_for_new_report_by_case,
-                )
-
-                waited_report = wait_for_new_report_by_case(
-                    str(ji.case_id),
-                    previous_analysis_id=prev_websearch_analysis_id,
-                    timeout_s=8.0,
-                    poll_interval_s=0.25,
-                )
-
-                if waited_report:
-                    websearch_report_wait = {
-                        "ok": True,
-                        "received": True,
-                        "analysis_id": waited_report.get("analysis_id"),
-                        "analyzed_at": waited_report.get("analyzed_at"),
-                    }
-                    logger.info(
-                        "[admin.make_judgement] 웹서치 리포트 수신 확인: case=%s analysis_id=%s",
-                        ji.case_id,
-                        waited_report.get("analysis_id"),
-                    )
-                else:
-                    websearch_report_wait = {
-                        "ok": True,
-                        "received": False,
-                        "message": "timeout_before_guidance",
-                    }
-                    logger.warning(
-                        "[admin.make_judgement] 웹서치 리포트 대기 타임아웃: case=%s",
-                        ji.case_id,
-                    )
-            except Exception as e:
-                websearch_report_wait = {
-                    "ok": False,
-                    "error": str(e),
-                }
-                logger.warning("[admin.make_judgement] 웹서치 리포트 대기 실패: %s", e)
+        # 웹서치는 guidance_generator에서 동기 호출로 처리
 
         result = {
             "ok": True,
@@ -1096,12 +1018,6 @@ def make_admin_tools(db: Session, guideline_repo):
         # 판정 후 즉시 전송 결과가 있으면 포함
         if judgement_send_result:
             result["judgement_send"] = judgement_send_result
-
-        # VP-Web-Search 전송 결과 포함
-        if websearch_result:
-            result["websearch"] = websearch_result
-        if websearch_report_wait:
-            result["websearch_report_wait"] = websearch_report_wait
 
         return result
 

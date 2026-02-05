@@ -5,6 +5,8 @@ import json
 from datetime import datetime
 from sqlalchemy.orm import Session
 import re
+import httpx
+import os
 
 from langchain_core.prompts import ChatPromptTemplate
 from app.services.llm_providers import agent_chat
@@ -113,6 +115,87 @@ H. 계좌동결 위협형: 범행계좌 연루 → 계좌 지급정지 위협 �
 
 WEB_SEARCH_MERGE_START_ROUND = 4
 
+# 웹서치 동기 호출 설정
+WEB_SEARCH_URL = os.getenv("WEB_SEARCH_URL", "http://localhost:8001")
+WEB_SEARCH_TIMEOUT = float(os.getenv("WEB_SEARCH_TIMEOUT", "60"))  # 60초
+
+def _call_web_search_sync_blocking(
+    case_id: str,
+    round_no: int,
+    turns: List[Dict[str, Any]],
+    judgement: Dict[str, Any],
+    scenario: Optional[Dict[str, Any]] = None,
+    victim_profile: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    동기 컨텍스트에서 웹 서치를 호출하는 래퍼 함수.
+    httpx 동기 클라이언트 사용 + polling으로 결과 대기.
+    """
+    import time
+
+    url = f"{WEB_SEARCH_URL}/api/v1/judgements"
+
+    payload = {
+        "case_id": case_id,
+        "round_no": round_no,
+        "turns": turns,
+        "judgement": judgement,
+        "scenario": scenario or {},
+        "victim_profile": victim_profile or {},
+        "source": "vp2_guidance_sync",
+    }
+
+    try:
+        logger.info(f"[WebSearchSync] 동기 호출 시작: case_id={case_id}, round={round_no}")
+
+        # 1) 웹서치 시스템에 분석 요청
+        with httpx.Client(timeout=120.0) as client:
+            response = client.post(
+                url,
+                json=payload,
+                headers={"Content-Type": "application/json"},
+                params={"auto_analyze": "true"},
+            )
+
+            if response.status_code not in (200, 201, 202):
+                logger.error(f"[WebSearchSync] 호출 실패: status={response.status_code}")
+                return None
+
+        logger.info(f"[WebSearchSync] 호출 완료, 결과 대기 중...")
+
+        # 2) polling으로 결과 대기 (HTTP API 통해 조회)
+        start_time = time.time()
+        poll_interval = 2.0  # 2초마다 체크
+
+        with httpx.Client(timeout=10.0) as poll_client:
+            while (time.time() - start_time) < WEB_SEARCH_TIMEOUT:
+                try:
+                    # HTTP API로 조회 (webhook이 저장한 데이터를 확실히 읽음)
+                    poll_response = poll_client.get(
+                        f"http://localhost:8000/api/external/webhook/reports/case/{case_id}",
+                    )
+                    if poll_response.status_code == 200:
+                        data = poll_response.json()
+                        if data.get("items"):
+                            report = data["items"][0]
+                            logger.info(f"[WebSearchSync] 리포트 수신 완료: case_id={case_id}, analysis_id={report.get('analysis_id')}")
+                            return report
+                except Exception as poll_err:
+                    logger.debug(f"[WebSearchSync] polling 에러: {poll_err}")
+
+                time.sleep(poll_interval)
+
+        logger.warning(f"[WebSearchSync] 리포트 대기 타임아웃: case_id={case_id}")
+        return None
+
+    except httpx.TimeoutException:
+        logger.error(f"[WebSearchSync] HTTP 타임아웃: case_id={case_id}")
+        return None
+    except Exception as e:
+        logger.error(f"[WebSearchSync] 블로킹 호출 에러: {e}")
+        return None
+
+
 GUIDANCE_MERGE_PROMPT = ChatPromptTemplate.from_messages([
     ("system", """
 당신은 보이스피싱 시뮬레이션 지침 통합 전문가입니다.
@@ -195,9 +278,39 @@ class DynamicGuidanceGenerator:
         vulnerabilities = (verdict or {}).get("victim_vulnerabilities") or []
         evidence = (verdict or {}).get("evidence", "")
 
-        # 3-1) 외부 웹서치 리포트(최근 수신본) 조회
-        external_report = get_latest_report_by_case(case_id) or {}
-        external_techniques = get_techniques_by_case(case_id)
+        # 3-1) 웹서치 동기 호출 (매 라운드마다 호출)
+        external_report = {}
+        external_techniques = []
+        web_search_triggered = False
+
+        logger.info(f"[GuidanceGenerator] 웹서치 동기 호출 시작: round={round_no}")
+
+        # 최근 로그를 웹서치용 turns로 변환
+        turns_for_search = [
+            {"role": log.get("role", ""), "text": log.get("content", "")}
+            for log in recent_logs
+        ]
+
+        # 동기적으로 웹서치 호출 및 결과 대기
+        web_search_result = _call_web_search_sync_blocking(
+            case_id=case_id,
+            round_no=round_no,
+            turns=turns_for_search,
+            judgement=verdict or {},
+            scenario=scenario,
+            victim_profile=victim_profile,
+        )
+
+        if web_search_result:
+            external_report = web_search_result
+            external_techniques = web_search_result.get("techniques", [])
+            web_search_triggered = True
+            logger.info(f"[GuidanceGenerator] 웹서치 동기 호출 완료: techniques={len(external_techniques)}개")
+        else:
+            # 동기 호출 실패 시 기존 저장된 리포트 사용 (fallback)
+            external_report = get_latest_report_by_case(case_id) or {}
+            external_techniques = get_techniques_by_case(case_id)
+            logger.warning(f"[GuidanceGenerator] 웹서치 동기 호출 실패, 기존 리포트 사용")
 
         # 4) 원본 지침 생성(웹서치 미반영)
         original_prompt_input = {
@@ -218,9 +331,9 @@ class DynamicGuidanceGenerator:
         original_content = getattr(original_response, "content", str(original_response))
         original_parsed = self._normalize_guidance_output(self._safe_json(original_content))
 
-        # 5) 웹서치 병합 적용 여부 판단
+        # 5) 웹서치 병합 적용 여부 판단 (외부 데이터 있으면 항상 병합)
         has_external_data = bool(external_report) or bool(external_techniques)
-        use_merged_guidance = round_no >= WEB_SEARCH_MERGE_START_ROUND and has_external_data
+        use_merged_guidance = has_external_data  # 라운드 조건 제거, 외부 데이터 있으면 항상 병합
 
         merged_parsed = original_parsed
         if use_merged_guidance:
@@ -247,6 +360,7 @@ class DynamicGuidanceGenerator:
                     "case_id": str(u) if u else case_id,
                     "round_no": round_no,
                     "merge_start_round": WEB_SEARCH_MERGE_START_ROUND,
+                    "web_search_triggered": web_search_triggered,
                     "has_external_data": has_external_data,
                     "use_merged_guidance": use_merged_guidance,
                     "external_report": external_report,
@@ -276,6 +390,7 @@ class DynamicGuidanceGenerator:
             "merged_guidance": merged_parsed,
             "selected_guidance": selected_guidance,
             "use_merged_guidance": use_merged_guidance,
+            "web_search_triggered": web_search_triggered,
             "merge_start_round": WEB_SEARCH_MERGE_START_ROUND,
         })
 
