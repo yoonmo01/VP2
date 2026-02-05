@@ -50,7 +50,7 @@ from app.services.agent.orchestrator_react import run_orchestrated, _ensure_stre
 VICTIM_IDS = [8, 9, 10, 11, 12, 13]
 
 # 시나리오(offender) ID 목록 (seed에서 확인된 값)
-OFFENDER_IDS = 4
+OFFENDER_IDS = [4]
 
 # 피해자당 케이스 수
 CASES_PER_VICTIM = 84
@@ -292,14 +292,7 @@ def get_completed_cases(victim_dir: Path) -> set:
     return completed
 
 
-async def run_victim_cases(
-    victim_id: int,
-    root_dir: Path,
-    progress_callback=None,
-) -> VictimProgress:
-    """
-    특정 피해자의 모든 케이스 실행
-    """
+async def run_victim_cases(victim_id: int, root_dir: Path, progress_callback=None) -> VictimProgress:
     victim_dir = root_dir / f"victim_{victim_id}"
     ok_dir = victim_dir / "ok"
     fail_dir = victim_dir / "failed"
@@ -308,65 +301,55 @@ async def run_victim_cases(
 
     progress = VictimProgress(victim_id=victim_id)
 
-    # 이미 완료된 케이스 확인
+    # 이미 성공 저장된 케이스 번호(성공 케이스만 카운트)
     completed_indices = get_completed_cases(ok_dir)
     progress.completed = len(completed_indices)
 
-    print(f"\n[Victim {victim_id}] 시작 - 완료: {progress.completed}/{CASES_PER_VICTIM}")
+    print(f"\n[Victim {victim_id}] 시작 - 성공: {progress.completed}/{CASES_PER_VICTIM}")
 
-    # 시나리오 순환을 위한 인덱스
     offender_cycle = 0
 
-    for case_idx in range(1, CASES_PER_VICTIM + 1):
-        # 이미 완료된 케이스는 스킵
-        if case_idx in completed_indices:
-            continue
+    # ✅ “성공 개수”가 84개가 될 때까지 계속 생성
+    attempt_no = 0
+    while progress.completed < CASES_PER_VICTIM:
+        attempt_no += 1
 
-        # 시나리오 순환 선택
+        # 다음 성공 케이스 번호를 채워넣기 (1..84 중 비어있는 번호)
+        # ex) 중간이 비었으면 그 번호부터 채우고 싶으면 이렇게:
+        for target_case_idx in range(1, CASES_PER_VICTIM + 1):
+            if target_case_idx not in completed_indices:
+                case_idx = target_case_idx
+                break
+
         offender_id = OFFENDER_IDS[offender_cycle % len(OFFENDER_IDS)]
         offender_cycle += 1
 
-        # 재시도 루프 (성공할 때까지 무한 반복)
-        retry = 0
-        while True:
-            retry += 1
-            print(f"  [Case {case_idx}/{CASES_PER_VICTIM}] offender={offender_id}, retry={retry}")
+        print(f"  [Make Success Case {case_idx:03d}] offender={offender_id}, attempt={attempt_no}")
 
-            result = await run_single_case(
-                victim_id=victim_id,
-                offender_id=offender_id,
-                case_index=case_idx,
-                ok_dir=ok_dir,
-                fail_dir=fail_dir,
-            )
+        # ✅ “한 번만 시도” 규칙: retry 루프 제거
+        result = await run_single_case(
+            victim_id=victim_id,
+            offender_id=offender_id,
+            case_index=case_idx,
+            ok_dir=ok_dir,
+            fail_dir=fail_dir,
+        )
 
-            progress.case_results.append(result)
+        progress.case_results.append(result)
 
-            if result.success:
-                progress.completed += 1
-                print(f"  [Case {case_idx}] 성공! rounds={result.rounds}, turns={result.turns_count}, websearch={result.websearch_used}")
-                break
-            else:
-                progress.failed += 1
-                print(f"  [Case {case_idx}] 실패: {result.error}")
+        if result.success:
+            progress.completed += 1
+            completed_indices.add(case_idx)
+            print(f"  [Case {case_idx:03d}] 성공! rounds={result.rounds}, turns={result.turns_count}, websearch={result.websearch_used}")
+        else:
+            progress.failed += 1
+            print(f"  [Case {case_idx:03d}] 실패(1회 시도 후 스킵): {result.error}")
 
-                # MAX_RETRIES_PER_CASE > 0 이면 제한, 0이면 무한 반복
-                if MAX_RETRIES_PER_CASE > 0 and retry >= MAX_RETRIES_PER_CASE:
-                    print(f"  [Case {case_idx}] 최대 재시도 횟수 도달, 스킵")
-                    break
-
-                # 재시도 대기 (backoff)
-                wait_time = SLEEP_SEC + (RETRY_BACKOFF_SEC * min(retry, 5))
-                print(f"  [Case {case_idx}] {wait_time:.1f}초 후 재시도...")
-                time.sleep(wait_time)
-
-        # 진행 콜백
         if progress_callback:
             progress_callback(victim_id, progress)
 
-        # 케이스 간 대기
         if SLEEP_SEC:
-            time.sleep(SLEEP_SEC)
+            await asyncio.sleep(SLEEP_SEC)
 
     return progress
 
