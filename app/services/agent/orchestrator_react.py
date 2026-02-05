@@ -2415,6 +2415,11 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
             judgements_history = []
             turns_all = []  # ✅ 아래에서 turns_by_round 기반으로 재구성
             guidance_history = []
+            # ✅ 원본(통째) 저장: 절대 필드 드랍하지 않기
+            judgements_full: List[Dict[str, Any]] = []          # admin.make_judgement 원본
+            guidances_full: List[Dict[str, Any]] = []           # admin.generate_guidance 원본(+input)
+            emotions_full_by_round: Dict[int, Any] = {}         # label_victim_emotions 원본(list/dict)
+            search_history: List[Dict[str, Any]] = []           # tavily/search 계열 input/output 원본
             # ✅ judgements_history 수집(=히스토리 생성) 전용 dedupe set
             judgement_seen_run_nos: Set[int] = set()
 
@@ -2436,9 +2441,32 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
                 logger.info(f"[DEBUG] Event {i}: type={ev.get('type')}, tool={ev.get('tool', 'N/A')}")
 
             for ev in cap.events:
+                # ✅ tool 입력 추적 (output에 input 같이 저장하기 위함)
+                if ev.get("type") == "action":
+                    _tool = ev.get("tool")
+                    _inp = ev.get("tool_input")
+                    # 필요하면 마지막 입력을 기억
+                    last_action_input = getattr(locals(), "last_action_input", {})
+                    if not isinstance(last_action_input, dict):
+                        last_action_input = {}
+                    last_action_input[_tool] = _inp
+                    locals()["last_action_input"] = last_action_input
                 if ev.get("type") == "observation":
                     tool_name = ev.get("tool")
                     output = ev.get("output")
+                    # ✅ search-agent 계열(tool명 prefix로) input/output 통째 저장
+                    try:
+                        if isinstance(tool_name, str) and (tool_name.startswith("tavily.") or tool_name.startswith("search.")):
+                            _lai = (locals().get("last_action_input") or {}).get(tool_name)
+                            search_history.append({
+                                "tool": tool_name,
+                                "action_input_raw": _lai,
+                                "action_input_parsed": _robust_action_input_to_dict(_lai) if _lai is not None else None,
+                                "observation_raw": output,
+                                "observation_parsed": _loose_parse_json_any(output),
+                            })
+                    except Exception:
+                        pass
                     logger.info(f"[DEBUG] Observation detected: tool={tool_name}, output_len={len(str(output))}")
                     # admin.make_judgement
                     if tool_name == "admin.make_judgement":
@@ -2459,6 +2487,11 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
                                 "phishing": judgement.get("phishing", False),
                                 "risk": judgement.get("risk", {}),
                                 "evidence": judgement.get("evidence", "")
+                            })
+                            # ✅ 원본 통째 저장 (취약점/HMM/세부근거 등 포함)
+                            judgements_full.append({
+                                "run_no": use_run_no,
+                                "raw": judgement,
                             })
                     
                     # mcp.simulator_run 결과 처리: 대화 로그를 testdb + TTS 캐시에 저장
@@ -2680,6 +2713,11 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
                         labeled_turns: Optional[List[Dict[str, Any]]] = None
                         # ✅ merge 대상 라운드: 직전 simulator_run의 round_key 우선
                         target_round = last_sim_round_key if isinstance(last_sim_round_key, int) else sim_run_idx
+                        # ✅ label_victim_emotions 원본 저장 (dict/list 그대로)
+                        try:
+                            emotions_full_by_round[int(target_round)] = labeled_any
+                        except Exception:
+                            pass
 
                         if isinstance(labeled_any, dict):
                             t = labeled_any.get("turns")
@@ -2851,8 +2889,19 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
                             guidance_history.append({
                                 "for_round": guidance_idx + 1,
                                 "kind": guidance_obj.get("type", ""),
-                                "text": guidance_obj.get("text", "")
+                                "text": guidance_obj.get("text", ""),
                             })
+                            # ✅ 원본 통째 저장 + (가능하면) input까지 같이 저장
+                            try:
+                                _lai = (locals().get("last_action_input") or {}).get("admin.generate_guidance")
+                                guidances_full.append({
+                                    "for_round": guidance_idx + 1,
+                                    "raw": guidance_obj,
+                                    "action_input_raw": _lai,
+                                    "action_input_parsed": _robust_action_input_to_dict(_lai) if _lai is not None else None,
+                                })
+                            except Exception:
+                                guidances_full.append({"for_round": guidance_idx + 1, "raw": guidance_obj})
 
             # ✅ 최종 turns_all 재구성(라벨링 덮어쓰기 반영)
             try:
@@ -3001,7 +3050,12 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
                 "personalized_prevention": prevention_obj,
                 "finished_reason": finished_reason,
                 "round_judgements": judgements_history,  # ★ 라운드별 판정 요약
-                # ✅ 명시적인 "라운드(판정) 위험도" vs "케이스(예방) 위험도" 동시 보존
+                # ✅ 통째 보존본
+                "round_judgements_full": judgements_full,        # admin.make_judgement raw
+                "guidances_full": guidances_full,                # admin.generate_guidance raw(+input)
+                "emotions_full_by_round": emotions_full_by_round, # label_victim_emotions raw
+                "search_history": search_history,                # tavily/search raw
+               # ✅ 명시적인 "라운드(판정) 위험도" vs "케이스(예방) 위험도" 동시 보존
                 # - judgement_* : admin.make_judgement 기반 (ex: critical)
                 # - case_*      : prevention.analysis 기반 (ex: high) source
                 "judgement_risk": {
@@ -3078,6 +3132,11 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
                         "rounds": rounds_payload,                 # ✅ 라운드별 turns/stats/ended_by
                         "round_judgements": judgements_history,   # 라운드별 판정 요약
                         "guidances": guidance_history,            # 다음 라운드용 guidance들
+                        # ✅ 통째 보존본(분석/재현/검증용)
+                        "guidances_full": guidances_full,
+                        "round_judgements_full": judgements_full,
+                        "emotions_full_by_round": emotions_full_by_round,
+                        "search_history": search_history,
                         "personalized_prevention": prevention_obj or {},
                         # 부가 메타
                         "meta": {

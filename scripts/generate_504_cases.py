@@ -4,24 +4,25 @@
 
 요구사항:
 - 총 504개 케이스 생성 (6명 피해자 × 84개 케이스 = 504개)
-- 각 케이스 JSON 포함 내용(최종 저장 파일 기준, 가능한 한 "통째로"):
+- 각 케이스 JSON 포함 내용:
   - 피해자 정보 (victim_profile)
-  - 모든 라운드 대화 (turns/rounds[*].turns)
-  - 각 대화의 감정 라벨링 (emotion labels, hmm_summary 등)
-  - 각 라운드 판정 (judgements/round_judgements 등)
+  - 모든 라운드 대화 (turns)
+  - 각 대화의 감정 라벨링 (emotion labels)
+  - 각 라운드 판정 (judgements)
   - 각 라운드 지침 (guidances)
-  - 지침마다 웹서치 사용 여부 (is_websearch)
-  - search-agent가 만든 결과/메타데이터(가능한 한 통째로: meta, used_tools, traces 등)
-- dump_case_json=True로 orchestrator가 dump_dir에 저장하는 파일이 있어도,
-  리턴(sim_result)과 dump 파일의 포맷/필드가 다를 수 있으므로,
-  최종 저장 파일은 dump + sim_result를 병합하여 "최대한 전체"를 보존한다.
+  - 지침마다 웹서치 시스템 사용 유무 (is_websearch)
+- 피해자별로 84개 케이스씩 별도 폴더에 저장
+- 모든 케이스 완료될 때까지 반복
+
+피해자 ID (seed): 8, 9, 10, 11, 12, 13
+시나리오(offender) ID (seed): 1~8
 """
 from __future__ import annotations
 
 import asyncio
+import uuid
 import json
 import traceback
-import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, List, Optional
@@ -42,26 +43,36 @@ from app.services.agent.orchestrator_react import run_orchestrated, _ensure_stre
 # =========================
 # 설정
 # =========================
-VICTIM_IDS = [9, 10, 11, 12, 13, 14]
-#VICTIM_IDS = [8, 9, 10, 11, 12, 13]
+# 피해자 ID 목록 (seed에서 확인된 값)
+VICTIM_IDS = [8, 9, 10, 11, 12, 13]
+
+# 시나리오(offender) ID 목록 (seed에서 확인된 값)
 OFFENDER_IDS = [4]
 
+# 피해자당 케이스 수
 CASES_PER_VICTIM = 84
+
+# 총 케이스 수
 TOTAL_CASES = len(VICTIM_IDS) * CASES_PER_VICTIM  # 6 * 84 = 504
 
-MAX_TURNS = 20
-ROUND_LIMIT = 5
+# 시뮬레이션 설정
+MAX_TURNS = 20           # 한 라운드 최대 턴 수
+ROUND_LIMIT = 5          # 최대 라운드 수
 
+# JSON 저장 폴더
 DUMP_DIR = str(_ROOT / "scripts" / "case_json_504")
 
+# 시도 간 쉬기(레이트/서버 부하 완화)
 SLEEP_SEC = 0.5
-MAX_RETRIES_PER_CASE = 1
+
+# 연속 실패 시 대기 시간 증가
 RETRY_BACKOFF_SEC = 2.0
 # =========================
 
 
 @dataclass
 class CaseResult:
+    """케이스 실행 결과"""
     victim_id: int
     offender_id: int
     case_index: int
@@ -76,6 +87,7 @@ class CaseResult:
 
 @dataclass
 class VictimProgress:
+    """피해자별 진행 상황"""
     victim_id: int
     total: int = CASES_PER_VICTIM
     completed: int = 0
@@ -92,83 +104,58 @@ def _write_json(path: Path, obj: dict) -> None:
     path.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def _read_json(path: Path) -> Dict[str, Any]:
+def _load_json(path: Path) -> Dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def _deep_merge(base: Any, override: Any) -> Any:
+def _resolve_dump_fields(dump_obj: Dict[str, Any]) -> Dict[str, Any]:
     """
-    base에 override를 "깊게" 병합.
-    - dict: key 단위로 재귀 병합 (override 우선)
-    - list: 기본적으로 override를 우선 채택 (원본 보존이 목적이면 리스트 병합이 위험)
-    - 그 외: override 우선
+    orchestrator dump JSON의 키가 버전에 따라 달라질 수 있어서
+    흔히 쓰는 후보 키들에서 유연하게 꺼내준다.
     """
-    if isinstance(base, dict) and isinstance(override, dict):
-        out = dict(base)
-        for k, v in override.items():
-            if k in out:
-                out[k] = _deep_merge(out[k], v)
-            else:
-                out[k] = v
-        return out
-    if isinstance(override, list):
-        return override
-    if override is not None:
-        return override
-    return base
+    rounds = dump_obj.get("rounds", dump_obj.get("round_no", dump_obj.get("total_rounds", 0))) or 0
 
+    turns = []
+    if isinstance(dump_obj.get("turns"), list):
+        turns = dump_obj["turns"]
+    elif isinstance(dump_obj.get("all_turns"), list):
+        turns = dump_obj["all_turns"]
+    elif isinstance(dump_obj.get("artifact"), dict) and isinstance(dump_obj["artifact"].get("turns"), list):
+        turns = dump_obj["artifact"]["turns"]
 
-def _find_latest_dumped_case_json(ok_dir: Path, case_id: str, stream_id: str) -> Optional[Path]:
-    """
-    orchestrator가 dump_dir(ok_dir)에 저장한 원본 JSON 파일을 최대한 정확히 찾는다.
-    우선순위:
-    1) 파일명에 case_id 포함
-    2) 파일명에 stream_id 포함
-    3) ok_dir 내 가장 최근 수정 json (fallback, 순차 실행 전제)
-    """
-    candidates: List[Path] = []
+    judgements = []
+    if isinstance(dump_obj.get("judgements"), list):
+        judgements = dump_obj["judgements"]
+    elif isinstance(dump_obj.get("all_judgements"), list):
+        judgements = dump_obj["all_judgements"]
+    elif isinstance(dump_obj.get("artifact"), dict) and isinstance(dump_obj["artifact"].get("judgements"), list):
+        judgements = dump_obj["artifact"]["judgements"]
 
-    if case_id:
-        candidates.extend([p for p in ok_dir.glob(f"*{case_id}*.json") if p.is_file()])
+    guidances = []
+    if isinstance(dump_obj.get("guidances"), list):
+        guidances = dump_obj["guidances"]
+    elif isinstance(dump_obj.get("all_guidances"), list):
+        guidances = dump_obj["all_guidances"]
+    elif isinstance(dump_obj.get("artifact"), dict) and isinstance(dump_obj["artifact"].get("guidances"), list):
+        guidances = dump_obj["artifact"]["guidances"]
 
-    if not candidates and stream_id:
-        candidates.extend([p for p in ok_dir.glob(f"*{stream_id}*.json") if p.is_file()])
+    victim_profile = dump_obj.get("victim_profile", {})
+    scenario = dump_obj.get("scenario", {})
 
-    if not candidates:
-        all_json = [p for p in ok_dir.glob("*.json") if p.is_file()]
-        if not all_json:
-            return None
-        all_json.sort(key=lambda x: x.stat().st_mtime, reverse=True)
-        return all_json[0]
+    websearch_used = any(
+        isinstance(g, dict) and g.get("is_websearch", False)
+        for g in guidances
+    )
 
-    candidates.sort(key=lambda x: x.stat().st_mtime, reverse=True)
-    return candidates[0]
-
-
-def _calc_stats(case_obj: Dict[str, Any]) -> Dict[str, Any]:
-    # rounds 수
-    rounds_done = 0
-    if isinstance(case_obj.get("rounds"), list):
-        rounds_done = len(case_obj["rounds"])
-    else:
-        rounds_done = int(case_obj.get("rounds_done") or case_obj.get("rounds") or 1)
-
-    # turns 수
-    turns_count = 0
-    if isinstance(case_obj.get("rounds"), list):
-        for r in case_obj["rounds"]:
-            if isinstance(r, dict) and isinstance(r.get("turns"), list):
-                turns_count += len(r["turns"])
-    elif isinstance(case_obj.get("turns"), list):
-        turns_count = len(case_obj["turns"])
-
-    # websearch_used
-    websearch_used = False
-    guidances = case_obj.get("guidances", [])
-    if isinstance(guidances, list):
-        websearch_used = any(isinstance(g, dict) and g.get("is_websearch", False) for g in guidances)
-
-    return {"rounds": rounds_done, "turns_count": turns_count, "websearch_used": websearch_used}
+    return {
+        "rounds": int(rounds) if isinstance(rounds, (int, float, str)) and str(rounds).isdigit() else 0,
+        "turns": turns,
+        "judgements": judgements,
+        "guidances": guidances,
+        "victim_profile": victim_profile,
+        "scenario": scenario,
+        "websearch_used": websearch_used,
+    }
 
 
 async def run_single_case(
@@ -179,14 +166,12 @@ async def run_single_case(
     fail_dir: Path,
 ) -> CaseResult:
     """
-    단일 케이스 실행 (핵심: 최종 저장 파일은 dump + sim_result를 "통째로" 병합)
+    단일 케이스 실행
 
-    목표:
-    - 감정 라벨링 붙은 대화로그(rounds/turns 내 emotion/hmm_summary 등)
-    - judgement 전체(admin.make_judgement 결과, round_judgements 등)
-    - guidance 전체(is_websearch 포함)
-    - search-agent 결과/메타(가능한 한 통째로: meta/used_tools/trace 등)
-    를 최종 victim*_case*.json에 모두 포함시키기
+    정책:
+    - orchestrator가 dump_dir에 생성한 "원본 dump JSON"을 그대로 사용한다.
+    - 이 dump 파일을 찾아서 원하는 규칙의 파일명으로 "rename"만 한다.
+    - 따라서 케이스당 결과 JSON은 1개만 남는다.
     """
     stream_id = str(uuid.uuid4())
     _ensure_stream(stream_id)
@@ -207,45 +192,41 @@ async def run_single_case(
             return run_orchestrated(db, payload)
 
     try:
+        # ✅ 실행 전 ok_dir 스냅샷: 새로 생성될 dump 파일을 식별하기 위함
+        before = {p.resolve() for p in ok_dir.glob("*.json")}
+
+        # 시뮬레이션 실행
         sim_result = await asyncio.to_thread(_work)
 
         if not isinstance(sim_result, dict):
             raise ValueError(f"시뮬레이션 결과가 dict가 아님: {type(sim_result)}")
 
-        case_id = str(sim_result.get("case_id") or stream_id)
+        case_id = str(sim_result.get("case_id", stream_id))
 
-        # 1) orchestrator가 dump_dir에 저장한 "원본" 파일 찾기
-        dumped_path = _find_latest_dumped_case_json(ok_dir=ok_dir, case_id=case_id, stream_id=stream_id)
-        dumped_obj: Dict[str, Any] = {}
-        if dumped_path and dumped_path.exists():
-            try:
-                dumped_obj = _read_json(dumped_path)
-            except Exception:
-                dumped_obj = {}
+        # ✅ 실행 후 새로 생긴 dump 파일 찾기
+        after = {p.resolve() for p in ok_dir.glob("*.json")}
+        created = sorted(list(after - before), key=lambda p: p.stat().st_mtime, reverse=True)
 
-        # 2) dump + sim_result를 통째로 병합 (override=sim_result 우선)
-        #    => dump에만 있던 값도 살리고, sim_result에만 있던 감정/판정/지침/메타도 살림
-        merged = _deep_merge(dumped_obj, sim_result)
+        if not created:
+            raise RuntimeError(
+                "dump_case_json=True 이지만 ok_dir에 새 JSON dump가 생성되지 않았습니다. "
+                "orchestrator dump 로직/경로(dump_dir)를 확인하세요."
+            )
 
-        # 3) 최종 파일명으로 저장
+        dump_path = created[0]
+
+        # ✅ 최종 파일명으로 rename (케이스당 1개 파일만 남김)
         filename = f"victim{victim_id}_case{case_index:03d}_{case_id[:8]}.json"
         artifact_path = ok_dir / filename
 
-        # 혹시 같은 이름 있으면 덮어쓰기
         if artifact_path.exists():
             artifact_path.unlink()
 
-        _write_json(artifact_path, merged)
+        dump_path.rename(artifact_path)
 
-        # 4) dump 원본 파일이 따로 남아있으면 정리(원하면 유지 가능)
-        #    단, dumped_path가 artifact_path와 다를 때만 삭제
-        if dumped_path and dumped_path.exists() and dumped_path.resolve() != artifact_path.resolve():
-            try:
-                dumped_path.unlink()
-            except Exception:
-                pass
-
-        stats = _calc_stats(merged)
+        # ✅ 결과 요약(필수 필드만): rename된 dump에서 읽어서 추출
+        dump_obj = _load_json(artifact_path)
+        resolved = _resolve_dump_fields(dump_obj)
 
         return CaseResult(
             victim_id=victim_id,
@@ -254,12 +235,13 @@ async def run_single_case(
             success=True,
             case_id=case_id,
             artifact_path=str(artifact_path),
-            rounds=stats["rounds"],
-            turns_count=stats["turns_count"],
-            websearch_used=stats["websearch_used"],
+            rounds=resolved["rounds"],
+            turns_count=len(resolved["turns"]),
+            websearch_used=resolved["websearch_used"],
         )
 
     except Exception as e:
+        # 실패 기록
         err_path = fail_dir / f"error_victim{victim_id}_case{case_index}_{_ts()}.json"
         _write_json(err_path, {
             "ok": False,
@@ -281,9 +263,11 @@ async def run_single_case(
 
 
 def get_completed_cases(victim_dir: Path) -> set:
+    """이미 완료된 케이스 인덱스 조회"""
     completed = set()
     if victim_dir.exists():
         for f in victim_dir.glob("victim*_case*.json"):
+            # victim8_case001_abc12345.json 형식에서 case 번호 추출
             name = f.stem
             parts = name.split("_")
             for p in parts:
@@ -305,30 +289,31 @@ async def run_victim_cases(victim_id: int, root_dir: Path, progress_callback=Non
 
     progress = VictimProgress(victim_id=victim_id)
 
+    # 이미 성공 저장된 케이스 번호(성공 케이스만 카운트)
     completed_indices = get_completed_cases(ok_dir)
     progress.completed = len(completed_indices)
 
     print(f"\n[Victim {victim_id}] 시작 - 성공: {progress.completed}/{CASES_PER_VICTIM}")
 
     offender_cycle = 0
-    attempt_no = 0
 
+    # “성공 개수”가 84개가 될 때까지 계속 생성
+    attempt_no = 0
     while progress.completed < CASES_PER_VICTIM:
         attempt_no += 1
 
-        case_idx = None
+        # 다음 성공 케이스 번호를 채워넣기 (1..84 중 비어있는 번호)
         for target_case_idx in range(1, CASES_PER_VICTIM + 1):
             if target_case_idx not in completed_indices:
                 case_idx = target_case_idx
                 break
-        if case_idx is None:
-            break
 
         offender_id = OFFENDER_IDS[offender_cycle % len(OFFENDER_IDS)]
         offender_cycle += 1
 
         print(f"  [Make Success Case {case_idx:03d}] offender={offender_id}, attempt={attempt_no}")
 
+        # “한 번만 시도”: 실패하면 스킵하고 다음 attempt에서 다시 빈 번호를 채우는 방식
         result = await run_single_case(
             victim_id=victim_id,
             offender_id=offender_id,
@@ -381,6 +366,7 @@ async def main():
         total_failed = sum(p.failed for p in all_progress.values())
         print(f"\n>>> 전체 진행: {total_completed}/{TOTAL_CASES} (실패: {total_failed})")
 
+    # 모든 피해자에 대해 순차 실행
     for victim_id in VICTIM_IDS:
         print(f"\n{'='*50}")
         print(f"[Victim {victim_id}] 케이스 생성 시작")
@@ -394,6 +380,7 @@ async def main():
 
         all_progress[victim_id] = progress
 
+        # 피해자별 요약 저장
         victim_summary_path = root_dir / f"victim_{victim_id}" / f"summary_{_ts()}.json"
         _write_json(victim_summary_path, {
             "victim_id": victim_id,
@@ -404,6 +391,7 @@ async def main():
             "success_rate": f"{progress.completed / progress.total * 100:.1f}%",
         })
 
+    # 전체 요약
     print("\n" + "=" * 70)
     print("=== 전체 완료 ===")
     print("=" * 70)
@@ -420,6 +408,7 @@ async def main():
     print(f"  - 실패: {total_failed}")
     print(f"  - 저장 경로: {root_dir}")
 
+    # 전체 요약 저장
     overall_summary_path = root_dir / f"overall_summary_{_ts()}.json"
     _write_json(overall_summary_path, {
         "timestamp": datetime.now().isoformat(),
@@ -435,7 +424,10 @@ async def main():
             "total_completed": total_completed,
             "total_failed": total_failed,
             "by_victim": {
-                str(vid): {"completed": p.completed, "failed": p.failed}
+                str(vid): {
+                    "completed": p.completed,
+                    "failed": p.failed,
+                }
                 for vid, p in all_progress.items()
             },
         },
