@@ -911,6 +911,16 @@ def _wrap_tool_force_json_input(original_tool, *, require_data_wrapper: bool = T
                     except Exception:
                         rounds = None
 
+                    # ✅ HARD GUARD: 최소 2라운드 보장
+                    # - LLM이 라운드1에서 critical이라며 make_prevention을 호출해도 여기서 막는다.
+                    if rounds is not None and rounds < MIN_ROUNDS:
+                        return {
+                            "ok": False,
+                            "error": "min_rounds_not_met",
+                            "message": f"admin.make_prevention은 최소 {MIN_ROUNDS}라운드 완료 후에만 호출 가능합니다. (입력 rounds={rounds})",
+                            "hint": "라운드2를 진행하기 위해 admin.generate_guidance → sim.compose_prompts(round_no=2, guidance 포함) → mcp.simulator_run(round_no=2) → label_victim_emotions(run_no=2) → admin.make_judgement(run_no=2) 순으로 계속 진행하세요.",
+                        }
+
                     turns_in = d.get("turns")
                     # 캐시에서 flatten한 "라운드별 라벨링된 turns" 생성
                     cached_all = _flatten_cached_turns_by_round(_EMO_CACHE[sid]["turns_by_round"], up_to_round=rounds)
@@ -2180,7 +2190,7 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
 
 단계 10: 예방책 생성 ← **필수**
 - **진입 조건**: 
-  * risk.level == "critical" OR
+  * (risk.level == "critical" AND N >= 2) OR
   * N == {max_rounds}
 - 도구: admin.make_prevention
 - 입력: {{"data": {{"case_id": CASE_ID, "rounds": N, "turns": [모든라운드_TURNS_LABELED], "judgements": [모든judgement], "guidances": [모든guidance]}}}}
@@ -2206,9 +2216,10 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
    - N이 {max_rounds}에 도달하면 단계 10으로
 
 2. **종료 조건 우선순위**
-   - 1순위: risk.level == "critical" → 즉시 단계 10
-   - 2순위: N == {max_rounds} → 즉시 단계 10
-   - 3순위: 계속 진행 (N < {max_rounds} AND not critical)
+   - 1순위: N < 2 인 경우에는 어떤 경우에도 종료 금지 (최소 2라운드 보장)
+   - 2순위: (N >= 2 AND risk.level == "critical") → 즉시 단계 10
+   - 3순위: (N == {max_rounds}) → 즉시 단계 10
+   - 4순위: 계속 진행 (그 외)
 
 3. **변수 재사용**
    - scenario, victim_profile: 1단계에서 받아서 모든 라운드 재사용
@@ -2254,6 +2265,9 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
 
 라운드3에서 critical 발생 시:
   6→7→8→8-1 체크: critical? YES → **즉시 10**
+
+라운드1에서 critical 발생 시:
+  2→3→4→5 → 6으로 진행 (최소 2라운드 보장)
 
 종료: 10 (예방책 생성) → 11 (예방책 저장) → 12 (Final Answer)
 
