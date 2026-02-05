@@ -218,12 +218,38 @@ ATTACKER_PROMPT = ChatPromptTemplate.from_messages([
 def format_guidance_block(guidance_type: str = "",
                           guidance_text: str = "",
                           guidance_categories: List[str] = None,
-                          guidance_reasoning: str = "") -> str:
-    """동적으로 생성된 지침을 포맷팅합니다."""
+                          guidance_reasoning: str = "",
+                          is_websearch: bool = False) -> str:
+    """동적으로 생성된 지침을 포맷팅합니다.
+
+    Args:
+        is_websearch: True면 웹서치 기반 지침이므로 reasoning만 리스트로 출력
+    """
 
     if not guidance_text or guidance_text.strip() == "":
         return "현재 라운드에서는 별도의 전략 지침이 제공되지 않았습니다. 기본적인 피싱 전략을 사용하세요."
 
+    # ★ 웹서치 지침인 경우: reasoning만 리스트로 출력 (전략/수법 제외)
+    if is_websearch and guidance_reasoning:
+        block_parts = []
+        block_parts.append("[웹서치 기반 최신 수법]")
+        # reasoning을 줄 단위로 분리하여 리스트로 표시
+        reasoning_items = [item.strip() for item in guidance_reasoning.replace("，", ",").split(",") if item.strip()]
+        if reasoning_items:
+            for item in reasoning_items:
+                block_parts.append(f"- {item}")
+        else:
+            block_parts.append(f"- {guidance_reasoning}")
+
+        block_parts.append("""
+[지침 적용 방법]
+- 위 최신 수법을 현재 단계의 표현·전략·어휘 선택에 적극적으로 반영한다.
+- 웹서치에서 발견된 수법을 자연스럽게 대화에 녹여낸다.
+- 단, 현재 단계의 기본 목표와 안전 규칙은 반드시 준수한다.
+""")
+        return "\n".join(block_parts)
+
+    # 기존 지침 포맷 (웹서치가 아닌 경우)
     block_parts = []
 
     # 지침 유형
@@ -363,11 +389,16 @@ def build_guidance_block_from_meta(guidance: Optional[Dict[str, Any]]) -> str:
     # guidance가 없으면 기본 문구를 넣어 빈칸이 되지 않게 한다.
     if not guidance:
         return "현재 라운드에서는 별도의 전략 지침이 제공되지 않았습니다. 기본적인 전략을 사용하세요."
+
+    # ★ 웹서치 기반 지침인지 확인 (source에 'websearch' 또는 is_websearch 플래그)
+    is_websearch = guidance.get("is_websearch", False) or "websearch" in guidance.get("source", "").lower()
+
     return format_guidance_block(
         guidance_type=guidance.get("type", ""),
         guidance_text=guidance.get("text", "") or "",
         guidance_categories=guidance.get("categories", []) or [],
         guidance_reasoning=guidance.get("reasoning", "") or "",
+        is_websearch=is_websearch,
     )
 
 def _build_scenario_reference_block_v2(scenario: Dict[str, Any]) -> str:

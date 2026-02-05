@@ -131,7 +131,7 @@ BASE_DIR = Path(__file__).parent
 SEEDS_DIR = BASE_DIR / "seeds"
 
 OFFENDERS_JSON = SEEDS_DIR / "offenders_v2.json"
-VICTIMS_JSON = SEEDS_DIR / "victims_v2.json"
+VICTIMS_JSON = SEEDS_DIR / "victims_paper.json"
 SCENARIO_JSON = SEEDS_DIR / "scenario.json"  # 옵션: 출력용
 
 # ✅ 신규 시드 파일(있으면 upsert)

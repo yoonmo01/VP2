@@ -29,7 +29,12 @@ from app.services.admin_summary import summarize_run_full  # turns 기반 사용
 from app.services.llm_providers import agent_chat
 
 # ★★ 추가: 동적 지침 생성기(2안)
-from app.services.agent.guidance_generator import DynamicGuidanceGenerator
+from app.services.agent.guidance_generator import (
+    DynamicGuidanceGenerator,
+    enable_web_search_for_case,
+    disable_web_search_for_case,
+)
+from app.services.agent.external_api import get_fail_tracker, send_to_websearch_every_round
 
 logger = get_logger(__name__)
 
@@ -977,29 +982,48 @@ def make_admin_tools(db: Session, guideline_repo):
         # Legacy check_and_trigger_external_api는 deprecated: 사용 중단
         external_api_result = None
 
-        # ★★ 판정 후 즉시 외부 시스템 전송 (감정 라벨 제거)
-        # EXTERNAL_API_SEND_ON_JUDGEMENT=1 && JUDGEMENT_THRESHOLD=1 이면 1회 판정 시 바로 전송
+        # ★★ 판정 후 연속 피싱 실패 체크 및 웹서치 활성화
+        # 연속 2회 피싱 실패 시 웹서치 시스템 호출 활성화
         judgement_send_result = None
         try:
-            from app.services.agent.external_api import send_judgement_to_external
+            phishing = bool(verdict.get("phishing", False))
+            tracker = get_fail_tracker()
+            should_trigger = tracker.record_judgement(case_id=str(ji.case_id), phishing=phishing)
 
-            judgement_send_result = send_judgement_to_external(
-                case_id=str(ji.case_id),
-                round_no=ji.run_no,
-                turns=normalized_turns,  # 원본 turns (함수 내에서 감정 라벨 제거)
-                judgement=verdict,
-                scenario=payload.get("scenario"),
-                victim_profile=payload.get("victim_profile"),
-            )
+            if should_trigger:
+                # ★ 연속 2회 피싱 실패 시 웹서치 활성화
+                enable_web_search_for_case(str(ji.case_id))
 
-            if judgement_send_result and judgement_send_result.get("triggered"):
-                logger.info(
-                    "[admin.make_judgement] 판정 후 외부 전송 완료: %s, turns_sent=%d",
-                    judgement_send_result.get("reason"),
-                    judgement_send_result.get("turns_sent", 0)
+                # 외부 시스템에 전송 (웹서치 분석 요청)
+                judgement_send_result = send_to_websearch_every_round(
+                    case_id=str(ji.case_id),
+                    round_no=ji.run_no,
+                    turns=normalized_turns,  # 내부에서 감정라벨 제거함
+                    judgement=verdict,
+                    scenario=payload.get("scenario"),
+                    victim_profile=payload.get("victim_profile"),
                 )
+
+                logger.info(
+                    "[admin.make_judgement] 연속 실패 2회 도달! 웹서치 활성화 및 전송 완료: case=%s round=%d",
+                    str(ji.case_id), ji.run_no
+                )
+            else:
+                # 피싱 성공 시 웹서치 비활성화 (카운터 리셋됨)
+                if phishing:
+                    disable_web_search_for_case(str(ji.case_id))
+                    logger.info(
+                        "[admin.make_judgement] 피싱 성공! 웹서치 비활성화: case=%s",
+                        str(ji.case_id)
+                    )
+                else:
+                    logger.info(
+                        "[admin.make_judgement] 연속 실패 임계값 미도달: case=%s (fail_count=%d)",
+                        str(ji.case_id), tracker.get_fail_count(str(ji.case_id))
+                    )
+
         except Exception as e:
-            logger.warning("[admin.make_judgement] 판정 후 외부 전송 실패: %s", e)
+            logger.warning("[admin.make_judgement] 연속 실패 트리거 처리 실패: %s", e)
 
         # 웹서치는 guidance_generator에서 동기 호출로 처리
 
@@ -1104,79 +1128,26 @@ def make_admin_tools(db: Session, guideline_repo):
             logger.exception("[admin.generate_guidance] 실패")
             return {"ok": False, "error": f"generator_failed: {e!s}"}
 
-        # LLM으로 간결한 text 생성 (한 두 줄)
-        전략_raw = result.get("전략", "")
-        수법_raw = result.get("수법", "")
-        reasoning = result.get("reasoning", "")
+        # ★ 웹서치 기반 지침인지 확인 (reasoning에 웹서치 내용이 있으면 is_websearch=True)
+        from app.services.agent.guidance_generator import is_web_search_enabled_for_case
+        is_websearch = is_web_search_enabled_for_case(str(case_uuid))
 
-        # 전략 코드 추출
-        전략_code = 전략_raw.split(".")[0].strip() if 전략_raw else "A"
-
-        # LLM으로 간결 요약 생성
-        try:
-            from app.services.llm_providers import agent_chat
-            summarize_llm = agent_chat(temperature=0.3)
-
-            victim_meta = (victim_profile or {}).get("meta", {})
-            victim_traits = ((victim_profile or {}).get("traits", {}) or {})
-            ocean = (victim_traits.get("ocean") or {})
-            vnotes = (victim_traits.get("vulnerability_notes") or [])
-            knowledge = ((victim_profile or {}).get("knowledge", {}) or {})
-            k_notes = (knowledge.get("comparative_notes") or [])
-
-            summarize_prompt = f"""
-        너는 보이스피싱 시뮬레이션용 '공격자 지침 문장'을 만드는 편집자다.
-        아래 [reasoning]은 길고 설명적이므로, 핵심만 압축해 "수법(행동지침)" 문장 안에 반드시 녹여라.
-
-        목표:
-        - 출력은 반드시 1~2문장, 150자 이내.
-        - 단순 요약 금지. reasoning에서 뽑은 핵심(피해자 특성 기반 이유/압박 포인트)을 "행동지침"으로 재구성.
-        - 주민번호/계좌비번처럼 노골적 요구는 피하고, '공식 절차/근거/법적 책임' 같은 심리 압박을 자연스럽게 포함.
-        - 형식: "{전략_code}. 수법명: 구체 행동지침(why가 포함된 형태)"
-
-        입력:
-        [피해자 메타] age={victim_meta.get("age")} gender={victim_meta.get("gender")} edu={victim_meta.get("education")}
-        [피해자 지식] {k_notes}
-        [성격(OCEAN)] {ocean}
-        [취약 노트] {vnotes}
-
-        [전략] {전략_raw}
-        [수법] {수법_raw}
-        [reasoning] {reasoning}
-
-        출력 제약:
-        - JSON/코드블록/따옴표 없이 문장만 출력
-        - "왜(근거)"를 한 덩어리로 짧게 포함 (예: "확인욕구를 충족시키고 처벌 우려로 즉시 협조를 유도")
-        """
-
-            summary_response = summarize_llm.invoke(summarize_prompt)
-            text_brief = getattr(summary_response, "content", str(summary_response)).strip()
-
-            # 너무 길면 자르기
-            if len(text_brief) > 150:
-                text_brief = text_brief[:147] + "..."
-
-        except Exception as e:
-            logger.warning(f"[admin.generate_guidance] 요약 생성 실패: {e}")
-            # fallback: 수법 이름만 추출
-            수법_name = ""
-            if 수법_raw and "." in 수법_raw:
-                after_code = 수법_raw.split(".", 1)[1] if "." in 수법_raw else 수법_raw
-                수법_name = after_code.split(":")[0].strip() if ":" in after_code else after_code.strip()
-            text_brief = f"{전략_code}. {수법_name}" if 수법_name else 전략_code
+        # ★ reasoning을 text 필드에도 넣어서 대화 생성 프롬프트에서 사용하도록 함
+        reasoning_text = result.get("reasoning", "")
 
         return {
             "ok": True,
-            "type": 전략_code,
-            "text": text_brief,
-            "전략": 전략_raw,
-            "수법": 수법_raw,
+            "type": "A",
+            "text": reasoning_text,  # ★ reasoning을 text로 사용 (대화 생성 프롬프트 input)
+            "전략": result.get("전략", ""),
+            "수법": result.get("수법", ""),
             "감정": result.get("감정", ""),
-            "reasoning": result.get("reasoning", ""),
+            "reasoning": reasoning_text,
             "expected_effect": result.get("expected_effect", ""),
             "risk_level": (verdict.get("risk") or {}).get("level", ""),
             "targets": verdict.get("victim_vulnerabilities", []),
-            "source": "dynamic_generator+verdict"
+            "source": "dynamic_generator+verdict",
+            "is_websearch": is_websearch,  # ★ 웹서치 기반 지침 여부
         }
 
     @tool(

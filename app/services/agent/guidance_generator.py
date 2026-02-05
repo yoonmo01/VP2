@@ -119,6 +119,26 @@ WEB_SEARCH_MERGE_START_ROUND = 4
 WEB_SEARCH_URL = os.getenv("WEB_SEARCH_URL", "http://localhost:8001")
 WEB_SEARCH_TIMEOUT = float(os.getenv("WEB_SEARCH_TIMEOUT", "60"))  # 60초
 
+# 웹서치 호출 활성화 플래그 (tools_admin에서 연속 실패 시 설정)
+_web_search_enabled_for_case: dict = {}  # case_id -> bool
+
+
+def enable_web_search_for_case(case_id: str) -> None:
+    """연속 피싱 실패 2회 시 해당 케이스의 웹서치 활성화"""
+    _web_search_enabled_for_case[str(case_id)] = True
+    logger.info(f"[GuidanceGenerator] 웹서치 활성화: case_id={case_id}")
+
+
+def disable_web_search_for_case(case_id: str) -> None:
+    """케이스의 웹서치 비활성화"""
+    _web_search_enabled_for_case.pop(str(case_id), None)
+    logger.info(f"[GuidanceGenerator] 웹서치 비활성화: case_id={case_id}")
+
+
+def is_web_search_enabled_for_case(case_id: str) -> bool:
+    """해당 케이스의 웹서치 활성화 여부 확인"""
+    return _web_search_enabled_for_case.get(str(case_id), False)
+
 def _call_web_search_sync_blocking(
     case_id: str,
     round_no: int,
@@ -230,6 +250,65 @@ GUIDANCE_MERGE_PROMPT = ChatPromptTemplate.from_messages([
 """),
 ])
 
+# ★ 웹서치 전용 지침 생성 프롬프트 (기존 지침 무시, 웹서치 데이터만 사용)
+WEBSEARCH_ONLY_GUIDANCE_PROMPT = ChatPromptTemplate.from_messages([
+    ("system", """
+당신은 보이스피싱 시뮬레이션을 위한 웹서치 기반 전략 지침 생성 전문가입니다.
+
+[목적]
+- 웹 서치 리포트와 추천 수법(techniques)에서 발견된 **최신 사기 수법과 트렌드**를 공격자에게 전달합니다.
+- 기존 지침은 무시하고, 오직 웹서치 데이터만 기반으로 지침을 생성합니다.
+
+[전략] - 반드시 하나만 선택
+A. 긴급성 강조: 시간 압박을 통한 판단력 흐림
+B. 전문성 연출: 용어, 절차, 공식성 강조
+C. 의심 무마: 보안 우려 해소, 정당성 강조
+D. 심리적 압박: 위협, 협박을 통한 강제성
+E. 격리 및 통제: 외부 접촉 차단, 물리적/심리적 고립 유도
+
+[수법] - 반드시 하나만 선택 (검찰/경찰 사칭 시나리오용)
+F. 범죄연루 협박형: 범죄 연루 의혹 제기 → 자금 전수조사 → 임시 보호관찰 → 격리 공간 유도 → 원격제어 앱 설치 → 주변 연락 차단, 물리적/심리적 격리로 완전 통제
+G. 권위 편향 활용: 검찰/경찰/금융기관 신분으로 즉각적 신뢰 획득, 전문 용어와 정확한 절차 지식으로 전문성 연출, 공신력 있는 기관명으로 무조건적 신뢰 유도
+H. 계좌동결 위협형: 범행계좌 연루 → 계좌 지급정지 위협 → 안전계좌 이체 유도, 자산 보호 심리 악용
+
+[출력 형식]
+반드시 다음 JSON 형식으로 응답하세요:
+```json
+{{
+    "전략": "A",
+    "수법": "F",
+    "감정": "",
+    "reasoning": "웹서치에서 발견된 최신 수법/트렌드만 기술 (전략/수법 설명 제외)",
+    "expected_effect": "예상되는 효과"
+}}
+```
+
+[필수 요구사항]
+- "전략"에서 A~E 중 하나만 선택 (알파벳 하나)
+- "수법"에서 F~H 중 하나만 선택 (알파벳 하나)
+- **reasoning에는 웹서치 리포트에서 발견된 최신 수법/트렌드 내용만 작성**
+- reasoning에 전략(A~E)이나 수법(F~H) 설명을 포함하지 말 것
+- reasoning 예시: "AI 음성 합성을 이용한 가족 사칭, 실시간 화면 공유 요구, 가상자산 계좌로 즉시 이체 유도 등 최신 수법 발견"
+"""),
+    ("human", """
+[웹서치 최신 리포트]
+{external_report}
+
+[웹서치 추천 수법(techniques)]
+{external_techniques}
+
+[시나리오 정보]
+{scenario}
+
+[피해자 프로필]
+{victim_profile}
+
+위 웹서치 데이터에서 발견된 **최신 사기 수법/트렌드**를 reasoning에 작성하세요.
+reasoning에는 전략(A~E)이나 수법(F~H) 설명을 넣지 마세요.
+오직 웹서치에서 발견된 실제 수법 내용만 작성하세요.
+"""),
+])
+
 
 class DynamicGuidanceGenerator:
     """
@@ -278,39 +357,45 @@ class DynamicGuidanceGenerator:
         vulnerabilities = (verdict or {}).get("victim_vulnerabilities") or []
         evidence = (verdict or {}).get("evidence", "")
 
-        # 3-1) 웹서치 동기 호출 (매 라운드마다 호출)
+        # 3-1) 웹서치 동기 호출 (피싱 실패 2회 연속일 때만 호출)
         external_report = {}
         external_techniques = []
         web_search_triggered = False
 
-        logger.info(f"[GuidanceGenerator] 웹서치 동기 호출 시작: round={round_no}")
+        # 웹서치 활성화 여부 확인 (연속 2회 피싱 실패 시 tools_admin에서 활성화)
+        web_search_enabled = is_web_search_enabled_for_case(case_id)
 
-        # 최근 로그를 웹서치용 turns로 변환
-        turns_for_search = [
-            {"role": log.get("role", ""), "text": log.get("content", "")}
-            for log in recent_logs
-        ]
+        if web_search_enabled:
+            logger.info(f"[GuidanceGenerator] 웹서치 동기 호출 시작 (연속 실패 트리거): round={round_no}")
 
-        # 동기적으로 웹서치 호출 및 결과 대기
-        web_search_result = _call_web_search_sync_blocking(
-            case_id=case_id,
-            round_no=round_no,
-            turns=turns_for_search,
-            judgement=verdict or {},
-            scenario=scenario,
-            victim_profile=victim_profile,
-        )
+            # 최근 로그를 웹서치용 turns로 변환
+            turns_for_search = [
+                {"role": log.get("role", ""), "text": log.get("content", "")}
+                for log in recent_logs
+            ]
 
-        if web_search_result:
-            external_report = web_search_result
-            external_techniques = web_search_result.get("techniques", [])
-            web_search_triggered = True
-            logger.info(f"[GuidanceGenerator] 웹서치 동기 호출 완료: techniques={len(external_techniques)}개")
+            # 동기적으로 웹서치 호출 및 결과 대기
+            web_search_result = _call_web_search_sync_blocking(
+                case_id=case_id,
+                round_no=round_no,
+                turns=turns_for_search,
+                judgement=verdict or {},
+                scenario=scenario,
+                victim_profile=victim_profile,
+            )
+
+            if web_search_result:
+                external_report = web_search_result
+                external_techniques = web_search_result.get("techniques", [])
+                web_search_triggered = True
+                logger.info(f"[GuidanceGenerator] 웹서치 동기 호출 완료: techniques={len(external_techniques)}개")
+            else:
+                # 동기 호출 실패 시 기존 저장된 리포트 사용 (fallback)
+                external_report = get_latest_report_by_case(case_id) or {}
+                external_techniques = get_techniques_by_case(case_id)
+                logger.warning(f"[GuidanceGenerator] 웹서치 동기 호출 실패, 기존 리포트 사용")
         else:
-            # 동기 호출 실패 시 기존 저장된 리포트 사용 (fallback)
-            external_report = get_latest_report_by_case(case_id) or {}
-            external_techniques = get_techniques_by_case(case_id)
-            logger.warning(f"[GuidanceGenerator] 웹서치 동기 호출 실패, 기존 리포트 사용")
+            logger.info(f"[GuidanceGenerator] 웹서치 비활성화 상태: round={round_no} (연속 실패 2회 미도달)")
 
         # 4) 원본 지침 생성(웹서치 미반영)
         original_prompt_input = {
@@ -331,25 +416,28 @@ class DynamicGuidanceGenerator:
         original_content = getattr(original_response, "content", str(original_response))
         original_parsed = self._normalize_guidance_output(self._safe_json(original_content))
 
-        # 5) 웹서치 병합 적용 여부 판단 (외부 데이터 있으면 항상 병합)
+        # 5) 웹서치 지침 적용 여부 판단 (외부 데이터 있으면 웹서치 지침만 사용, 병합 안함)
         has_external_data = bool(external_report) or bool(external_techniques)
-        use_merged_guidance = has_external_data  # 라운드 조건 제거, 외부 데이터 있으면 항상 병합
+        use_websearch_guidance = has_external_data  # 웹서치 데이터 있으면 웹서치 지침만 사용
 
-        merged_parsed = original_parsed
-        if use_merged_guidance:
-            merge_prompt_input = {
-                "original_guidance": json.dumps(original_parsed, ensure_ascii=False, indent=2),
+        websearch_parsed = original_parsed
+        if use_websearch_guidance:
+            # ★ 기존 지침과 병합하지 않고, 웹서치 리포트 기반으로 지침 생성
+            websearch_prompt_input = {
                 "external_report": json.dumps(external_report, ensure_ascii=False, indent=2),
                 "external_techniques": json.dumps(external_techniques, ensure_ascii=False, indent=2),
+                "scenario": json.dumps(scenario, ensure_ascii=False, indent=2),
+                "victim_profile": json.dumps(victim_profile, ensure_ascii=False, indent=2),
             }
-            merge_chain = GUIDANCE_MERGE_PROMPT | self.llm
-            merge_response = merge_chain.invoke(merge_prompt_input)
-            merge_content = getattr(merge_response, "content", str(merge_response))
-            merged_parsed = self._normalize_guidance_output(self._safe_json(merge_content))
+            websearch_chain = WEBSEARCH_ONLY_GUIDANCE_PROMPT | self.llm
+            websearch_response = websearch_chain.invoke(websearch_prompt_input)
+            websearch_content = getattr(websearch_response, "content", str(websearch_response))
+            websearch_parsed = self._normalize_guidance_output(self._safe_json(websearch_content))
+            logger.info(f"[GuidanceGenerator] 웹서치 지침만 사용 (기존 지침 병합 안함)")
 
         # 6) 기본값 보강 (실사용은 selected_guidance만 사용)
-        selected_guidance = merged_parsed if use_merged_guidance else original_parsed
-        selected_guidance.setdefault("reasoning", "원본 지침과 웹서치 리포트를 결합해 전략을 선택" if use_merged_guidance else "판정 결과와 최근 로그를 근거로 전략을 선택")
+        selected_guidance = websearch_parsed if use_websearch_guidance else original_parsed
+        selected_guidance.setdefault("reasoning", "웹서치 리포트만 기반으로 전략을 선택 (기존 지침 무시)" if use_websearch_guidance else "판정 결과와 최근 로그를 근거로 전략을 선택")
         selected_guidance.setdefault("expected_effect", "의심 감소 및 즉시 행동 유도")
 
         # 7) 웹서치/원본/최종 통합 로깅
@@ -361,12 +449,13 @@ class DynamicGuidanceGenerator:
                     "round_no": round_no,
                     "merge_start_round": WEB_SEARCH_MERGE_START_ROUND,
                     "web_search_triggered": web_search_triggered,
+                    "web_search_enabled": web_search_enabled if 'web_search_enabled' in dir() else False,
                     "has_external_data": has_external_data,
-                    "use_merged_guidance": use_merged_guidance,
+                    "use_websearch_guidance": use_websearch_guidance,
                     "external_report": external_report,
                     "external_techniques": external_techniques,
                     "original_guidance": original_parsed,
-                    "merged_guidance": merged_parsed,
+                    "websearch_guidance": websearch_parsed,
                     "selected_guidance": selected_guidance,
                 },
                 ensure_ascii=False,
@@ -387,10 +476,11 @@ class DynamicGuidanceGenerator:
             "external_report": external_report,
             "external_techniques": external_techniques,
             "original_guidance": original_parsed,
-            "merged_guidance": merged_parsed,
+            "websearch_guidance": websearch_parsed,
             "selected_guidance": selected_guidance,
-            "use_merged_guidance": use_merged_guidance,
+            "use_websearch_guidance": use_websearch_guidance,
             "web_search_triggered": web_search_triggered,
+            "web_search_enabled": web_search_enabled if 'web_search_enabled' in dir() else False,
             "merge_start_round": WEB_SEARCH_MERGE_START_ROUND,
         })
 
@@ -485,9 +575,10 @@ class DynamicGuidanceGenerator:
                     "external_report": context.get("external_report", {}),
                     "external_techniques": context.get("external_techniques", []),
                     "original_guidance": context.get("original_guidance", {}),
-                    "merged_guidance": context.get("merged_guidance", {}),
+                    "websearch_guidance": context.get("websearch_guidance", {}),
                     "selected_guidance": context.get("selected_guidance", {}),
-                    "use_merged_guidance": context.get("use_merged_guidance", False),
+                    "use_websearch_guidance": context.get("use_websearch_guidance", False),
+                    "web_search_enabled": context.get("web_search_enabled", False),
                     "merge_start_round": context.get("merge_start_round"),
                 }
             }

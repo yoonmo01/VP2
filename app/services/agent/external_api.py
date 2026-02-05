@@ -30,7 +30,7 @@ EXTERNAL_API_TIMEOUT = float(os.getenv("EXTERNAL_API_TIMEOUT", "120"))  # 웹 �
 EXTERNAL_API_ENABLED = os.getenv("EXTERNAL_API_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
 
 # 연속 피싱 실패 임계값 (이 값 이상 연속 실패 시 외부 API 호출)
-CONSECUTIVE_FAIL_THRESHOLD = int(os.getenv("EXTERNAL_API_FAIL_THRESHOLD", "3"))
+CONSECUTIVE_FAIL_THRESHOLD = int(os.getenv("EXTERNAL_API_FAIL_THRESHOLD", "2"))
 
 # 판정 후 즉시 외부 전송 (테스트용: 1회 이상 판정 시 바로 전송)
 # EXTERNAL_API_SEND_ON_JUDGEMENT=1 이면 판정 1회 이상 시 바로 외부 시스템에 전송
@@ -908,7 +908,7 @@ def send_judgement_to_external(
 
 
 # ─────────────────────────────────────────────────────────
-# 매 라운드 판정 후 무조건 웹 서치 시스템 호출
+# 연속 2회 실패 판정 후 무조건 웹 서치 시스템 호출
 # ─────────────────────────────────────────────────────────
 def send_to_websearch_every_round(
     case_id: str,
