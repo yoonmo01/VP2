@@ -564,31 +564,12 @@ async def send_conversation_from_db(
 # ─────────────────────────────────────────────────────────
 # Webhook 수신 (VP-Web-Search → VP2)
 # ─────────────────────────────────────────────────────────
-# 메모리 저장소 (실제 운영에서는 DB로 대체)
-_received_reports: Dict[str, Dict[str, Any]] = {}
-
-
-def get_latest_report_by_case(case_id: str) -> Optional[Dict[str, Any]]:
-    """
-    case_id로 가장 최신 웹 서치 리포트 조회
-    - guidance_generator에서 호출하여 지침에 활용
-    """
-    results = [v for v in _received_reports.values() if v.get("case_id") == case_id]
-    if not results:
-        return None
-    # analyzed_at 기준 최신순 정렬
-    results.sort(key=lambda x: x.get("analyzed_at", ""), reverse=True)
-    return results[0]
-
-
-def get_techniques_by_case(case_id: str) -> List[Dict[str, Any]]:
-    """
-    case_id로 웹 서치에서 생성된 techniques 목록 조회
-    """
-    report = get_latest_report_by_case(case_id)
-    if not report:
-        return []
-    return report.get("techniques", [])
+from app.services.agent.external_reports_store import (
+    get_received_report as get_stored_report_by_analysis_id,
+    get_reports_by_case as get_stored_reports_by_case,
+    list_received_reports as list_stored_received_reports,
+    save_received_report,
+)
 
 
 @router.post("/webhook/receive-report", response_model=WebhookResponse)
@@ -611,7 +592,7 @@ async def receive_analysis_report(
         )
 
         # 메모리에 저장
-        _received_reports[payload.analysis_id] = {
+        save_received_report(payload.analysis_id, {
             "type": payload.type,
             "case_id": payload.case_id,
             "analysis_id": payload.analysis_id,
@@ -621,7 +602,7 @@ async def receive_analysis_report(
             "error": payload.error,
             "analyzed_at": payload.analyzed_at,
             "received_at": datetime.utcnow().isoformat(),
-        }
+        })
 
         if payload.type == "analysis_complete":
             logger.info(
@@ -670,7 +651,7 @@ async def list_received_reports(limit: int = 50):
     """
     수신된 분석 리포트 목록 조회
     """
-    items = list(_received_reports.values())[-limit:]
+    items = list_stored_received_reports(limit=limit)
     return {
         "ok": True,
         "count": len(items),
@@ -683,7 +664,7 @@ async def get_received_report(analysis_id: str):
     """
     특정 분석 리포트 조회
     """
-    data = _received_reports.get(analysis_id)
+    data = get_stored_report_by_analysis_id(analysis_id)
     if not data:
         raise HTTPException(status_code=404, detail="분석 리포트 없음")
     return {"ok": True, "data": data}
@@ -694,7 +675,7 @@ async def get_reports_by_case(case_id: str):
     """
     케이스별 분석 리포트 조회
     """
-    results = [v for v in _received_reports.values() if v.get("case_id") == case_id]
+    results = get_stored_reports_by_case(case_id)
     if not results:
         raise HTTPException(status_code=404, detail="해당 케이스의 분석 리포트 없음")
     return {"ok": True, "count": len(results), "items": results}
