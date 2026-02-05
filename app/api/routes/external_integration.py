@@ -7,6 +7,7 @@
 - GET /api/external/health: 외부 시스템 헬스 체크
 """
 from __future__ import annotations
+from datetime import datetime
 from typing import Dict, Any, List, Optional
 from uuid import UUID
 
@@ -126,6 +127,43 @@ class FailTrackerStatusResponse(BaseModel):
     consecutive_fails: int
     threshold: int
     will_trigger_next_fail: bool
+
+
+# ─────────────────────────────────────────────────────────
+# Webhook 수신용 스키마
+# ─────────────────────────────────────────────────────────
+class WebhookTechnique(BaseModel):
+    name: str
+    description: str
+    application: str
+    expected_effect: str
+    fit_score: float
+
+
+class WebhookReport(BaseModel):
+    summary: Optional[str] = None
+    vulnerabilities: List[str] = []
+    techniques: List[WebhookTechnique] = []
+    recommendations: List[str] = []
+    implementation_guide: Optional[str] = None
+
+
+class WebhookPayload(BaseModel):
+    type: str = Field(..., description="analysis_complete 또는 analysis_error")
+    case_id: str
+    analysis_id: str
+    report: Optional[Dict[str, Any]] = None
+    techniques: List[Dict[str, Any]] = []
+    sources_count: Optional[int] = None
+    error: Optional[str] = None
+    analyzed_at: str
+
+
+class WebhookResponse(BaseModel):
+    ok: bool
+    message: str
+    case_id: str
+    analysis_id: str
 
 
 # ─────────────────────────────────────────────────────────
@@ -521,3 +559,142 @@ async def send_conversation_from_db(
     else:
         result = client.send_conversation(payload)
         return result
+
+
+# ─────────────────────────────────────────────────────────
+# Webhook 수신 (VP-Web-Search → VP2)
+# ─────────────────────────────────────────────────────────
+# 메모리 저장소 (실제 운영에서는 DB로 대체)
+_received_reports: Dict[str, Dict[str, Any]] = {}
+
+
+def get_latest_report_by_case(case_id: str) -> Optional[Dict[str, Any]]:
+    """
+    case_id로 가장 최신 웹 서치 리포트 조회
+    - guidance_generator에서 호출하여 지침에 활용
+    """
+    results = [v for v in _received_reports.values() if v.get("case_id") == case_id]
+    if not results:
+        return None
+    # analyzed_at 기준 최신순 정렬
+    results.sort(key=lambda x: x.get("analyzed_at", ""), reverse=True)
+    return results[0]
+
+
+def get_techniques_by_case(case_id: str) -> List[Dict[str, Any]]:
+    """
+    case_id로 웹 서치에서 생성된 techniques 목록 조회
+    """
+    report = get_latest_report_by_case(case_id)
+    if not report:
+        return []
+    return report.get("techniques", [])
+
+
+@router.post("/webhook/receive-report", response_model=WebhookResponse)
+async def receive_analysis_report(
+    payload: WebhookPayload,
+    db: Session = Depends(get_db),
+):
+    """
+    VP-Web-Search 시스템에서 분석 결과를 수신하는 Webhook 엔드포인트
+
+    - type: "analysis_complete" (성공) 또는 "analysis_error" (실패)
+    - case_id: 분석 대상 케이스 ID
+    - report: 분석 리포트 (summary, vulnerabilities, techniques, recommendations)
+    - techniques: 생성된 공격 수법 목록
+    """
+    try:
+        logger.info(
+            f"[Webhook] 수신: type={payload.type}, case_id={payload.case_id}, "
+            f"analysis_id={payload.analysis_id}"
+        )
+
+        # 메모리에 저장
+        _received_reports[payload.analysis_id] = {
+            "type": payload.type,
+            "case_id": payload.case_id,
+            "analysis_id": payload.analysis_id,
+            "report": payload.report,
+            "techniques": payload.techniques,
+            "sources_count": payload.sources_count,
+            "error": payload.error,
+            "analyzed_at": payload.analyzed_at,
+            "received_at": datetime.utcnow().isoformat(),
+        }
+
+        if payload.type == "analysis_complete":
+            logger.info(
+                f"[Webhook] 분석 완료 수신: case_id={payload.case_id}, "
+                f"techniques={len(payload.techniques)}개, sources={payload.sources_count}개"
+            )
+
+            # TODO: 여기서 공격자 에이전트에 새로운 수법 전달 가능
+            # 예: await update_attacker_techniques(payload.case_id, payload.techniques)
+
+            return WebhookResponse(
+                ok=True,
+                message=f"분석 리포트 수신 완료: {len(payload.techniques)}개 수법",
+                case_id=payload.case_id,
+                analysis_id=payload.analysis_id,
+            )
+
+        elif payload.type == "analysis_error":
+            logger.warning(
+                f"[Webhook] 분석 에러 수신: case_id={payload.case_id}, "
+                f"error={payload.error}"
+            )
+            return WebhookResponse(
+                ok=True,
+                message=f"분석 에러 수신: {payload.error}",
+                case_id=payload.case_id,
+                analysis_id=payload.analysis_id,
+            )
+
+        else:
+            logger.warning(f"[Webhook] 알 수 없는 타입: {payload.type}")
+            return WebhookResponse(
+                ok=False,
+                message=f"알 수 없는 타입: {payload.type}",
+                case_id=payload.case_id,
+                analysis_id=payload.analysis_id,
+            )
+
+    except Exception as e:
+        logger.exception(f"[Webhook] 수신 처리 실패: {e}")
+        raise HTTPException(status_code=500, detail=f"Webhook 처리 실패: {e}")
+
+
+@router.get("/webhook/reports")
+async def list_received_reports(limit: int = 50):
+    """
+    수신된 분석 리포트 목록 조회
+    """
+    items = list(_received_reports.values())[-limit:]
+    return {
+        "ok": True,
+        "count": len(items),
+        "items": items,
+    }
+
+
+@router.get("/webhook/reports/{analysis_id}")
+async def get_received_report(analysis_id: str):
+    """
+    특정 분석 리포트 조회
+    """
+    data = _received_reports.get(analysis_id)
+    if not data:
+        raise HTTPException(status_code=404, detail="분석 리포트 없음")
+    return {"ok": True, "data": data}
+
+
+@router.get("/webhook/reports/case/{case_id}")
+async def get_reports_by_case(case_id: str):
+    """
+    케이스별 분석 리포트 조회
+    """
+    results = [v for v in _received_reports.values() if v.get("case_id") == case_id]
+    if not results:
+        raise HTTPException(status_code=404, detail="해당 케이스의 분석 리포트 없음")
+    return {"ok": True, "count": len(results), "items": results}
