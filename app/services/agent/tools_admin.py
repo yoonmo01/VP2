@@ -974,30 +974,8 @@ def make_admin_tools(db: Session, guideline_repo):
             except Exception:
                 pass
 
-        # ★ 연속 피싱 실패 시 외부 API 호출 체크 (Legacy)
+        # Legacy check_and_trigger_external_api는 deprecated: 사용 중단
         external_api_result = None
-        try:
-            from app.services.agent.external_api import check_and_trigger_external_api
-            phishing_result = bool(verdict.get("phishing", False))
-
-            external_api_result = check_and_trigger_external_api(
-                case_id=str(ji.case_id),
-                phishing=phishing_result,
-                turns=normalized_turns,
-                scenario={},  # 필요 시 payload에서 추출
-                victim_profile={},
-                guidance={},
-                judgement=verdict,
-                round_no=ji.run_no,
-            )
-
-            if external_api_result and external_api_result.get("triggered"):
-                logger.info(
-                    "[admin.make_judgement] 외부 API 호출됨: %s",
-                    external_api_result.get("reason")
-                )
-        except Exception as e:
-            logger.warning("[admin.make_judgement] 외부 API 체크 실패: %s", e)
 
         # ★★ 판정 후 즉시 외부 시스템 전송 (감정 라벨 제거)
         # EXTERNAL_API_SEND_ON_JUDGEMENT=1 && JUDGEMENT_THRESHOLD=1 이면 1회 판정 시 바로 전송
@@ -1025,8 +1003,13 @@ def make_admin_tools(db: Session, guideline_repo):
 
         # ★★★ 매 라운드 판정 후 VP-Web-Search 시스템에 무조건 전송
         websearch_result = None
+        prev_websearch_analysis_id = None
         try:
             from app.services.agent.external_api import send_to_websearch_every_round
+            from app.services.agent.external_reports_store import get_latest_report_by_case
+
+            prev_latest_report = get_latest_report_by_case(str(ji.case_id)) or {}
+            prev_websearch_analysis_id = prev_latest_report.get("analysis_id")
 
             websearch_result = send_to_websearch_every_round(
                 case_id=str(ji.case_id),
@@ -1053,6 +1036,51 @@ def make_admin_tools(db: Session, guideline_repo):
         except Exception as e:
             logger.warning("[admin.make_judgement] VP-Web-Search 전송 예외: %s", e)
 
+        # ★★★★ 웹서치 리포트 수신 대기(가이던스 생성 전에 반영되도록 짧게 블로킹)
+        websearch_report_wait = None
+        if websearch_result and websearch_result.get("ok"):
+            try:
+                from app.services.agent.external_reports_store import (
+                    get_latest_report_by_case,
+                    wait_for_new_report_by_case,
+                )
+
+                waited_report = wait_for_new_report_by_case(
+                    str(ji.case_id),
+                    previous_analysis_id=prev_websearch_analysis_id,
+                    timeout_s=8.0,
+                    poll_interval_s=0.25,
+                )
+
+                if waited_report:
+                    websearch_report_wait = {
+                        "ok": True,
+                        "received": True,
+                        "analysis_id": waited_report.get("analysis_id"),
+                        "analyzed_at": waited_report.get("analyzed_at"),
+                    }
+                    logger.info(
+                        "[admin.make_judgement] 웹서치 리포트 수신 확인: case=%s analysis_id=%s",
+                        ji.case_id,
+                        waited_report.get("analysis_id"),
+                    )
+                else:
+                    websearch_report_wait = {
+                        "ok": True,
+                        "received": False,
+                        "message": "timeout_before_guidance",
+                    }
+                    logger.warning(
+                        "[admin.make_judgement] 웹서치 리포트 대기 타임아웃: case=%s",
+                        ji.case_id,
+                    )
+            except Exception as e:
+                websearch_report_wait = {
+                    "ok": False,
+                    "error": str(e),
+                }
+                logger.warning("[admin.make_judgement] 웹서치 리포트 대기 실패: %s", e)
+
         result = {
             "ok": True,
             "persisted": persisted,
@@ -1072,6 +1100,8 @@ def make_admin_tools(db: Session, guideline_repo):
         # VP-Web-Search 전송 결과 포함
         if websearch_result:
             result["websearch"] = websearch_result
+        if websearch_report_wait:
+            result["websearch_report_wait"] = websearch_report_wait
 
         return result
 
