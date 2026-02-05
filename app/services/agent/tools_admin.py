@@ -974,7 +974,7 @@ def make_admin_tools(db: Session, guideline_repo):
             except Exception:
                 pass
 
-        # ★ 연속 피싱 실패 시 외부 API 호출 체크
+        # ★ 연속 피싱 실패 시 외부 API 호출 체크 (Legacy)
         external_api_result = None
         try:
             from app.services.agent.external_api import check_and_trigger_external_api
@@ -999,6 +999,30 @@ def make_admin_tools(db: Session, guideline_repo):
         except Exception as e:
             logger.warning("[admin.make_judgement] 외부 API 체크 실패: %s", e)
 
+        # ★★ 판정 후 즉시 외부 시스템 전송 (감정 라벨 제거)
+        # EXTERNAL_API_SEND_ON_JUDGEMENT=1 && JUDGEMENT_THRESHOLD=1 이면 1회 판정 시 바로 전송
+        judgement_send_result = None
+        try:
+            from app.services.agent.external_api import send_judgement_to_external
+
+            judgement_send_result = send_judgement_to_external(
+                case_id=str(ji.case_id),
+                round_no=ji.run_no,
+                turns=normalized_turns,  # 원본 turns (함수 내에서 감정 라벨 제거)
+                judgement=verdict,
+                scenario=payload.get("scenario"),
+                victim_profile=payload.get("victim_profile"),
+            )
+
+            if judgement_send_result and judgement_send_result.get("triggered"):
+                logger.info(
+                    "[admin.make_judgement] 판정 후 외부 전송 완료: %s, turns_sent=%d",
+                    judgement_send_result.get("reason"),
+                    judgement_send_result.get("turns_sent", 0)
+                )
+        except Exception as e:
+            logger.warning("[admin.make_judgement] 판정 후 외부 전송 실패: %s", e)
+
         result = {
             "ok": True,
             "persisted": persisted,
@@ -1007,9 +1031,13 @@ def make_admin_tools(db: Session, guideline_repo):
             **verdict,
         }
 
-        # 외부 API 결과가 있으면 포함
+        # 외부 API 결과가 있으면 포함 (Legacy)
         if external_api_result:
             result["external_api"] = external_api_result
+
+        # 판정 후 즉시 전송 결과가 있으면 포함
+        if judgement_send_result:
+            result["judgement_send"] = judgement_send_result
 
         return result
 

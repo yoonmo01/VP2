@@ -24,8 +24,12 @@ from app.services.agent.external_api import (
     get_external_client,
     is_external_api_enabled,
     set_external_api_enabled,
+    is_send_on_judgement_enabled,
+    set_send_on_judgement_enabled,
     get_fail_tracker,
+    get_judgement_tracker,
     CONSECUTIVE_FAIL_THRESHOLD,
+    JUDGEMENT_SEND_THRESHOLD,
 )
 
 logger = get_logger(__name__)
@@ -97,11 +101,24 @@ class HealthResponse(BaseModel):
 class SettingsResponse(BaseModel):
     enabled: bool
     fail_threshold: int
+    send_on_judgement_enabled: bool
+    judgement_threshold: int
     message: str
 
 
 class SetEnabledRequest(BaseModel):
     enabled: bool = Field(..., description="외부 API 활성화 여부")
+
+
+class SetSendOnJudgementRequest(BaseModel):
+    enabled: bool = Field(..., description="판정 시 즉시 전송 활성화 여부")
+
+
+class JudgementTrackerStatusResponse(BaseModel):
+    case_id: str
+    judgement_count: int
+    threshold: int
+    already_sent: bool
 
 
 class FailTrackerStatusResponse(BaseModel):
@@ -121,10 +138,14 @@ async def get_settings():
 
     - enabled: 현재 활성화 상태
     - fail_threshold: 연속 실패 임계값
+    - send_on_judgement_enabled: 판정 시 즉시 전송 활성화 상태
+    - judgement_threshold: 판정 횟수 임계값
     """
     return SettingsResponse(
         enabled=is_external_api_enabled(),
         fail_threshold=CONSECUTIVE_FAIL_THRESHOLD,
+        send_on_judgement_enabled=is_send_on_judgement_enabled(),
+        judgement_threshold=JUDGEMENT_SEND_THRESHOLD,
         message="현재 설정 조회 완료",
     )
 
@@ -141,8 +162,61 @@ async def set_enabled(request: SetEnabledRequest):
     return SettingsResponse(
         enabled=is_external_api_enabled(),
         fail_threshold=CONSECUTIVE_FAIL_THRESHOLD,
+        send_on_judgement_enabled=is_send_on_judgement_enabled(),
+        judgement_threshold=JUDGEMENT_SEND_THRESHOLD,
         message=f"외부 API {'활성화' if request.enabled else '비활성화'}됨",
     )
+
+
+@router.post("/settings/send-on-judgement", response_model=SettingsResponse)
+async def set_send_on_judgement(request: SetSendOnJudgementRequest):
+    """
+    판정 시 즉시 전송 ON/OFF 설정
+
+    - enabled=true: 판정 1회 이상 시 즉시 외부 시스템에 전송 (감정 라벨 제거)
+    - enabled=false: 비활성화 (기존 연속 실패 방식만 사용)
+
+    환경변수: EXTERNAL_API_SEND_ON_JUDGEMENT
+    임계값: EXTERNAL_API_JUDGEMENT_THRESHOLD (기본 1)
+    """
+    set_send_on_judgement_enabled(request.enabled)
+    return SettingsResponse(
+        enabled=is_external_api_enabled(),
+        fail_threshold=CONSECUTIVE_FAIL_THRESHOLD,
+        send_on_judgement_enabled=is_send_on_judgement_enabled(),
+        judgement_threshold=JUDGEMENT_SEND_THRESHOLD,
+        message=f"판정 시 즉시 전송 {'활성화' if request.enabled else '비활성화'}됨",
+    )
+
+
+@router.get("/judgement-tracker/{case_id}", response_model=JudgementTrackerStatusResponse)
+async def get_judgement_tracker_status(case_id: str):
+    """
+    케이스별 판정 횟수 현황 조회
+
+    - judgement_count: 현재 판정 횟수
+    - threshold: 전송 트리거 임계값
+    - already_sent: 이미 전송됨 여부
+    """
+    tracker = get_judgement_tracker()
+    count = tracker.get_count(case_id)
+
+    return JudgementTrackerStatusResponse(
+        case_id=case_id,
+        judgement_count=count,
+        threshold=JUDGEMENT_SEND_THRESHOLD,
+        already_sent=(count >= JUDGEMENT_SEND_THRESHOLD),
+    )
+
+
+@router.delete("/judgement-tracker/{case_id}")
+async def reset_judgement_tracker(case_id: str):
+    """
+    케이스의 판정 횟수 카운터 리셋
+    """
+    tracker = get_judgement_tracker()
+    tracker.reset(case_id)
+    return {"ok": True, "message": f"케이스 {case_id}의 판정 카운터가 리셋되었습니다."}
 
 
 @router.get("/fail-tracker/{case_id}", response_model=FailTrackerStatusResponse)

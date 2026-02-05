@@ -32,10 +32,22 @@ EXTERNAL_API_ENABLED = os.getenv("EXTERNAL_API_ENABLED", "0").strip().lower() in
 # 연속 피싱 실패 임계값 (이 값 이상 연속 실패 시 외부 API 호출)
 CONSECUTIVE_FAIL_THRESHOLD = int(os.getenv("EXTERNAL_API_FAIL_THRESHOLD", "3"))
 
+# 판정 후 즉시 외부 전송 (테스트용: 1회 이상 판정 시 바로 전송)
+# EXTERNAL_API_SEND_ON_JUDGEMENT=1 이면 판정 1회 이상 시 바로 외부 시스템에 전송
+SEND_ON_JUDGEMENT_ENABLED = os.getenv("EXTERNAL_API_SEND_ON_JUDGEMENT", "0").strip().lower() in ("1", "true", "yes", "on")
+
+# 판정 횟수 임계값 (기본 1: 1회 이상 판정 시 전송)
+JUDGEMENT_SEND_THRESHOLD = int(os.getenv("EXTERNAL_API_JUDGEMENT_THRESHOLD", "1"))
+
 
 def is_external_api_enabled() -> bool:
     """외부 API 호출 활성화 여부"""
     return EXTERNAL_API_ENABLED
+
+
+def is_send_on_judgement_enabled() -> bool:
+    """판정 시 즉시 외부 전송 활성화 여부"""
+    return SEND_ON_JUDGEMENT_ENABLED
 
 
 def set_external_api_enabled(enabled: bool) -> None:
@@ -43,6 +55,13 @@ def set_external_api_enabled(enabled: bool) -> None:
     global EXTERNAL_API_ENABLED
     EXTERNAL_API_ENABLED = enabled
     logger.info("[ExternalAPI] 활성화 상태 변경: %s", "ON" if enabled else "OFF")
+
+
+def set_send_on_judgement_enabled(enabled: bool) -> None:
+    """판정 시 즉시 외부 전송 활성화/비활성화 (런타임 변경)"""
+    global SEND_ON_JUDGEMENT_ENABLED
+    SEND_ON_JUDGEMENT_ENABLED = enabled
+    logger.info("[ExternalAPI] 판정 시 즉시 전송: %s", "ON" if enabled else "OFF")
 
 
 class ExternalAPIError(Exception):
@@ -614,3 +633,275 @@ def check_and_trigger_external_api(
         "trigger_from_summary_tool()을 사용하세요."
     )
     return None
+
+
+# ─────────────────────────────────────────────────────────
+# 판정 후 즉시 외부 시스템 전송 (감정 라벨 제거)
+# ─────────────────────────────────────────────────────────
+def _strip_emotion_labels_from_turns(turns: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    대화 turns에서 감정 라벨링 정보를 제거하고 순수 대화 내용만 반환
+
+    제거 대상:
+    - emotion, pred4, pred8, probs4, probs8
+    - hmm, hmm_summary, hmm_result
+    - cue_scores, surprise_to, emotion4, emotion8
+
+    반환:
+    - role, text/content/dialogue만 포함된 clean turns
+    """
+    EMOTION_KEYS = {
+        "emotion", "pred4", "pred8", "probs4", "probs8",
+        "hmm", "hmm_summary", "hmm_result",
+        "cue_scores", "surprise_to", "emotion4", "emotion8",
+        "is_convinced", "thoughts",  # 피해자 내면 정보도 제거
+    }
+
+    clean_turns: List[Dict[str, Any]] = []
+
+    for t in turns:
+        if not isinstance(t, dict):
+            continue
+
+        # 기본 정보만 추출
+        role = t.get("role") or t.get("speaker") or t.get("actor") or "unknown"
+
+        # text 추출 (다양한 형식 지원)
+        text = t.get("text") or t.get("content") or t.get("dialogue") or ""
+
+        # text가 JSON 형식인 경우 dialogue만 추출
+        if isinstance(text, str) and text.strip().startswith("{"):
+            try:
+                obj = json.loads(text)
+                if isinstance(obj, dict) and "dialogue" in obj:
+                    text = obj.get("dialogue", "")
+            except json.JSONDecodeError:
+                pass
+        elif isinstance(text, dict):
+            text = text.get("dialogue") or text.get("text") or str(text)
+
+        # clean turn 생성
+        clean_turn = {
+            "role": str(role).strip().lower(),
+            "text": str(text).strip() if text else "",
+            "turn_index": t.get("turn_index") or t.get("turn") or len(clean_turns),
+        }
+
+        # 유효한 턴만 추가 (빈 텍스트 제외)
+        if clean_turn["text"]:
+            clean_turns.append(clean_turn)
+
+    return clean_turns
+
+
+# 판정 횟수 추적기 (케이스별)
+class JudgementCountTracker:
+    """
+    케이스별 판정 횟수 추적
+    - 판정 1회 이상 시 외부 API 호출 트리거 (설정에 따라)
+    """
+
+    def __init__(self, threshold: int = JUDGEMENT_SEND_THRESHOLD):
+        self.threshold = threshold
+        self._counts: Dict[str, int] = {}  # case_id -> judgement count
+        self._sent: Dict[str, bool] = {}   # case_id -> 이미 전송됨 여부
+
+    def record_judgement(self, case_id: str) -> bool:
+        """
+        판정 결과 기록 및 외부 API 전송 필요 여부 반환
+
+        Args:
+            case_id: 케이스 ID
+
+        Returns:
+            bool: 외부 API 전송이 필요하면 True
+        """
+        case_id = str(case_id)
+
+        # 카운터 증가
+        current = self._counts.get(case_id, 0) + 1
+        self._counts[case_id] = current
+
+        logger.info(
+            "[JudgementTracker] case=%s 판정 횟수: %d/%d",
+            case_id, current, self.threshold
+        )
+
+        # 임계값 도달 체크
+        if current >= self.threshold:
+            # 이미 전송된 경우 중복 방지
+            if self._sent.get(case_id, False):
+                logger.debug("[JudgementTracker] case=%s 이미 전송됨, 스킵", case_id)
+                return False
+
+            self._sent[case_id] = True
+            logger.info(
+                "[JudgementTracker] case=%s %d회 판정 도달 → 외부 API 전송 트리거!",
+                case_id, current
+            )
+            return True
+
+        return False
+
+    def get_count(self, case_id: str) -> int:
+        """현재 판정 횟수 조회"""
+        return self._counts.get(str(case_id), 0)
+
+    def reset(self, case_id: str) -> None:
+        """케이스 카운터 리셋"""
+        case_id = str(case_id)
+        self._counts.pop(case_id, None)
+        self._sent.pop(case_id, None)
+
+    def reset_all(self) -> None:
+        """전체 카운터 리셋"""
+        self._counts.clear()
+        self._sent.clear()
+
+
+# 싱글톤 인스턴스
+_judgement_tracker: Optional[JudgementCountTracker] = None
+
+
+def get_judgement_tracker() -> JudgementCountTracker:
+    """싱글톤 판정 추적기 반환"""
+    global _judgement_tracker
+    if _judgement_tracker is None:
+        _judgement_tracker = JudgementCountTracker()
+    return _judgement_tracker
+
+
+@dataclass
+class JudgementSendPayload:
+    """판정 후 외부 시스템에 전송할 데이터"""
+    case_id: str
+    round_no: int
+    turns: List[Dict[str, Any]]  # 감정 라벨 제거된 순수 대화
+    judgement: Dict[str, Any]    # 판정 결과
+    scenario: Optional[Dict[str, Any]] = None
+    victim_profile: Optional[Dict[str, Any]] = None
+    timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "case_id": self.case_id,
+            "round_no": self.round_no,
+            "turns": self.turns,
+            "judgement": self.judgement,
+            "scenario": self.scenario or {},
+            "victim_profile": self.victim_profile or {},
+            "timestamp": self.timestamp,
+            "source": "judgement_trigger",
+        }
+
+
+def send_judgement_to_external(
+    case_id: str,
+    round_no: int,
+    turns: List[Dict[str, Any]],
+    judgement: Dict[str, Any],
+    scenario: Optional[Dict[str, Any]] = None,
+    victim_profile: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    판정 후 즉시 외부 시스템에 대화+판정 전송
+
+    - EXTERNAL_API_SEND_ON_JUDGEMENT=1 일 때만 동작
+    - 감정 라벨이 제거된 순수 대화 내용만 전송
+    - 판정 결과(phishing, risk, evidence 등) 포함
+
+    Args:
+        case_id: 케이스 ID
+        round_no: 라운드 번호
+        turns: 원본 대화 turns (감정 라벨 포함 가능)
+        judgement: 판정 결과 (make_judgement의 verdict)
+        scenario: 시나리오 정보 (선택)
+        victim_profile: 피해자 프로필 (선택)
+
+    Returns:
+        전송 결과 또는 None (비활성화 상태)
+    """
+    # 1) ON/OFF 체크
+    if not is_send_on_judgement_enabled():
+        logger.debug("[ExternalAPI] 판정 시 즉시 전송 비활성화 상태, 스킵")
+        return None
+
+    # 2) 판정 횟수 체크
+    tracker = get_judgement_tracker()
+    should_send = tracker.record_judgement(case_id)
+
+    if not should_send:
+        logger.debug("[ExternalAPI] case=%s 아직 임계값 미도달, 전송 스킵", case_id)
+        return None
+
+    logger.info("[ExternalAPI] 판정 후 즉시 전송 트리거! case=%s, round=%d", case_id, round_no)
+
+    # 3) 감정 라벨 제거
+    clean_turns = _strip_emotion_labels_from_turns(turns)
+
+    logger.info(
+        "[ExternalAPI] 감정 라벨 제거: 원본 %d턴 → 정제 %d턴",
+        len(turns), len(clean_turns)
+    )
+
+    # 4) 전송 payload 생성
+    payload = JudgementSendPayload(
+        case_id=str(case_id),
+        round_no=round_no,
+        turns=clean_turns,
+        judgement=judgement,
+        scenario=scenario,
+        victim_profile=victim_profile,
+    )
+
+    # 5) 외부 API 호출
+    try:
+        client = get_external_client()
+        url = f"{client.base_url}/api/v1/judgements"
+
+        logger.info(
+            "[ExternalAPI] 판정 전송 요청: case_id=%s, round=%d, turns=%d",
+            case_id, round_no, len(clean_turns)
+        )
+
+        with httpx.Client(timeout=client.timeout) as http_client:
+            response = http_client.post(
+                url,
+                json=payload.to_dict(),
+                headers=client._get_headers(),
+            )
+
+        result = client._handle_response(response, "판정 전송")
+
+        logger.info(
+            "[ExternalAPI] 판정 전송 성공! case_id=%s, status=%s",
+            case_id, result.get("status", "ok")
+        )
+
+        return {
+            "triggered": True,
+            "reason": f"판정 {tracker.get_count(case_id)}회 도달",
+            "case_id": case_id,
+            "round_no": round_no,
+            "turns_sent": len(clean_turns),
+            "result": result,
+        }
+
+    except ExternalAPIError as e:
+        logger.error("[ExternalAPI] 판정 전송 실패: %s", e)
+        return {
+            "triggered": True,
+            "reason": f"판정 {tracker.get_count(case_id)}회 도달",
+            "case_id": case_id,
+            "round_no": round_no,
+            "error": str(e),
+        }
+    except Exception as e:
+        logger.exception("[ExternalAPI] 판정 전송 예외")
+        return {
+            "triggered": True,
+            "reason": f"판정 {tracker.get_count(case_id)}회 도달",
+            "case_id": case_id,
+            "round_no": round_no,
+            "error": str(e),
+        }
