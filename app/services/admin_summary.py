@@ -279,7 +279,32 @@ def _normalize_role(turn: Dict[str, Any]) -> str:
     return "unknown"
 
 def _get_turn_text(turn: Dict[str, Any]) -> str:
-    return (turn.get("text") or turn.get("content") or turn.get("dialogue") or "").strip()
+    """
+    turns의 text/content가 문자열이 아닐 수 있는 케이스까지 안전하게 처리.
+    - text가 dict이면 role에 따라 dialogue/utterance/raw 우선 추출
+    - 최후에는 str(...)로 강제 문자열화
+    """
+    v = turn.get("text")
+    if v is None:
+        v = turn.get("content") or turn.get("dialogue") or turn.get("utterance")
+
+    # text가 dict인 경우 (예: {"dialogue": "...", "is_convinced": ...})
+    if isinstance(v, dict):
+        role = _normalize_role(turn)
+        if role == "victim":
+            s = v.get("dialogue") or v.get("utterance") or v.get("raw")
+        elif role == "offender":
+            s = v.get("utterance") or v.get("dialogue") or v.get("raw")
+        else:
+            s = v.get("dialogue") or v.get("utterance") or v.get("raw")
+        return (s or "").strip()
+
+    # 문자열이면 그대로
+    if isinstance(v, str):
+        return v.strip()
+
+    # 그 외 타입은 문자열화
+    return (str(v) if v is not None else "").strip()
 
 # =========================
 # LLM 프롬프트 (전체 대화: 공격자+피해자)

@@ -113,6 +113,125 @@ def _default_emotion_enabled() -> bool:
     # EMOTION_ENABLED=0 이면 tool이 no-op로 동작
     return _env_bool("EMOTION_ENABLED", True)
 
+def _default_emotion_compact() -> bool:
+    """
+    감정 출력(token)을 줄이기 위한 compact 모드.
+    - True: emotion = {"final": "<N|F|A|E|S>"} 형태로만 남김
+    - False: 기존처럼 pred/probs/override 등 전체를 유지
+    env: EMOTION_COMPACT (default: True)
+    """
+    return _env_bool("EMOTION_COMPACT", True)
+
+def _compact_hmm_summary_payload(hs: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    hmm_summary를 요구사항에 맞게 축약:
+    - state_names 제거
+    - meta.meta에서 obs_norm, state_counts, v3_ratio만 유지
+    - viterbi_logp/loglik 등 제거
+    """
+    out: Dict[str, Any] = {}
+
+    # admin_summary에서 p_v3/v3_ratio를 뽑아 쓰므로 final_state/final_probs는 유지
+    if isinstance(hs.get("final_state"), str) and hs.get("final_state"):
+        out["final_state"] = hs.get("final_state")
+    fp = hs.get("final_probs")
+    if isinstance(fp, (list, tuple)) and len(fp) == 3:
+        out["final_probs"] = list(fp)
+
+    meta = hs.get("meta")
+    if isinstance(meta, dict):
+        inner = meta.get("meta") if isinstance(meta.get("meta"), dict) else meta
+        if isinstance(inner, dict):
+            mm: Dict[str, Any] = {}
+            if isinstance(inner.get("obs_norm"), list):
+                mm["obs_norm"] = inner.get("obs_norm")
+            if isinstance(inner.get("state_counts"), dict):
+                mm["state_counts"] = inner.get("state_counts")
+            if "v3_ratio" in inner:
+                try:
+                    mm["v3_ratio"] = float(inner.get("v3_ratio"))
+                except Exception:
+                    pass
+            if mm:
+                out["meta"] = {"meta": mm}
+
+    return out
+
+def _apply_compact_hmm_in_place(turns: List[Dict[str, Any]]) -> None:
+    """
+    compact 모드에서 HMM 출력까지 축약:
+    - victim turn의 per-turn "hmm" 제거 (posterior/viterbi/state_names 등 제거 목적)
+    - hmm_summary는 마지막 victim turn에만 1개 유지 + 축약(state_names 제거, meta 필드 최소화)
+    """
+    if not turns:
+        return
+
+    last_hmm_summary: Optional[Dict[str, Any]] = None
+    last_victim_idx: Optional[int] = None
+
+    # 1) 후보 수집 + per-turn hmm 제거
+    for i, t in enumerate(turns):
+        if not isinstance(t, dict):
+            continue
+        role = (t.get("role") or t.get("speaker") or t.get("actor") or "").strip().lower()
+        if role == "victim":
+            last_victim_idx = i
+            # ✅ 요구사항: victim turn의 hmm는 전부 제거
+            t.pop("hmm", None)
+
+        hs = t.get("hmm_summary")
+        if isinstance(hs, dict) and hs:
+            last_hmm_summary = hs
+
+    # 2) 전체에서 hmm_summary 제거 후, 마지막 victim에만 축약본 재부착
+    for t in turns:
+        if isinstance(t, dict):
+            t.pop("hmm_summary", None)
+
+    if last_hmm_summary and last_victim_idx is not None:
+        turns[last_victim_idx]["hmm_summary"] = _compact_hmm_summary_payload(last_hmm_summary)
+
+_PRED8_TO_FINAL = {
+    # pred8이 한글/영문으로 들어오는 케이스 방어
+    "중립": "N", "neutral": "N", "N": "N",
+    "두려움": "F", "fear": "F", "F": "F",
+    "분노": "A", "anger": "A", "A": "A",
+    "기쁨": "E", "excite": "E", "excitement": "E", "E": "E",
+    "놀라움": "S", "surprise": "S", "S": "S",
+}
+
+def _compact_emotion_payload_in_place(turn: Dict[str, Any]) -> None:
+    """
+    turn["emotion"]을 최종 감정만 남기도록 축약.
+    최종 감정은 우선순위:
+      1) emotion["final"]
+      2) emotion["pred4"]
+      3) emotion["pred8"] (한글/영문 매핑)
+    결과:
+      turn["emotion"] = {"final": "<code>"}
+    """
+    emo = turn.get("emotion")
+    if not isinstance(emo, dict):
+        return
+
+    final = emo.get("final")
+    if isinstance(final, str) and final.strip():
+        code = final.strip()
+    else:
+        pred4 = emo.get("pred4")
+        if isinstance(pred4, str) and pred4.strip():
+            code = pred4.strip()
+        else:
+            pred8 = emo.get("pred8")
+            if isinstance(pred8, str) and pred8.strip():
+                key = pred8.strip()
+                code = _PRED8_TO_FINAL.get(key, _PRED8_TO_FINAL.get(key.lower(), "N"))
+            else:
+                code = "N"
+
+    # ✅ 요구사항: 최종 감정만 남김 (final: "F" 같은 형태)
+    turn["emotion"] = {"final": code}
+
 def _sanitize_pair_mode(v: Any) -> PairMode:
     s = (str(v).strip() if v is not None else "")
     if s in _PAIR_MODE_ALLOWED:
@@ -145,6 +264,7 @@ class LabelVictimEmotionsInput(BaseModel):
     """
     turns: List[Dict[str, Any]] = Field(..., description="full turns list")
     enabled: bool = Field(default_factory=_default_emotion_enabled, description="감정 주입 ON/OFF (env: EMOTION_ENABLED)")
+    compact: bool = Field(default_factory=_default_emotion_compact, description="감정 출력 축약 (env: EMOTION_COMPACT)")
     pair_mode: PairMode = Field(default_factory=_default_pair_mode)
     batch_size: int = 16
     max_length: int = 512
@@ -207,6 +327,7 @@ def label_victim_emotions(
     turns: Any,
     # ✅ 직접 호출(테스트/스크립트)에서도 env 변경이 반영되게 런타임에 결정
     enabled: Optional[bool] = None,
+    compact: Optional[bool] = None,
     pair_mode: Optional[PairMode] = None,
     batch_size: int = 16,
     max_length: int = 512,
@@ -225,6 +346,8 @@ def label_victim_emotions(
     # ✅ 최후 방어: tool_input 파싱이 어긋나서 turns가 문자열/딕트로 들어오는 케이스를 여기서도 흡수
     if enabled is None:
         enabled = _default_emotion_enabled()
+    if compact is None:
+        compact = _default_emotion_compact()
     if pair_mode is None:
         pair_mode = _default_pair_mode()
     if isinstance(turns, str):
@@ -236,6 +359,8 @@ def label_victim_emotions(
         # enabled도 payload로 들어오면 우선
         if "enabled" in turns:
             enabled = bool(turns.get("enabled"))
+        if "compact" in turns:
+            compact = bool(turns.get("compact"))
         run_hmm = turns.get("run_hmm", run_hmm)
         hmm_attach = turns.get("hmm_attach", hmm_attach)
         pair_mode = _sanitize_pair_mode(turns.get("pair_mode", pair_mode))
@@ -288,6 +413,19 @@ def label_victim_emotions(
     if not isinstance(labeled, list):
         return original_turns
 
+    # ✅ 토큰 절약: EMOTION_COMPACT=1이면 감정+HMM 출력까지 같이 축약
+    if compact:
+        for t in labeled:
+            if not isinstance(t, dict):
+                continue
+            role = (t.get("role") or t.get("speaker") or t.get("actor") or "").strip().lower()
+            if role == "victim" and "emotion" in t:
+                _compact_emotion_payload_in_place(t)
+        # ✅ HMM도 함께 축약( per-turn hmm 제거 + hmm_summary 최소화 )
+        if run_hmm:
+            _apply_compact_hmm_in_place(labeled)
+
+
     # 1) 이상적 케이스: 길이가 같으면 그대로 사용
     if len(labeled) == len(original_turns):
         return labeled
@@ -315,6 +453,17 @@ def label_victim_emotions(
                     if k in PROTECT_KEYS:
                         continue
                     merged[idx][k] = v
+        # merged에도 compact 적용(overlay 경로에서도 최종 감정만 남기도록 보장)
+        if compact:
+            for t in merged:
+                if not isinstance(t, dict):
+                    continue
+                role = (t.get("role") or t.get("speaker") or t.get("actor") or "").strip().lower()
+                if role == "victim" and "emotion" in t:
+                    _compact_emotion_payload_in_place(t)
+            # overlay 경로에서도 HMM 축약 보장
+            if run_hmm:
+                _apply_compact_hmm_in_place(merged)
         return merged
 
     # 3) 그 외: 안전하게 원본 유지(혹은 labeled가 더 길면 앞부분만 overlay 등도 가능하지만,
