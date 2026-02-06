@@ -817,15 +817,62 @@ def _wrap_tool_force_json_input(original_tool, *, require_data_wrapper: bool = T
         Proxy wrapper for a LangChain tool.
         Ensures Action Input is parsed into a dict and forwarded to original_tool.invoke().
         """
+        tool_name = getattr(original_tool, "name", "") or ""
+
+        def _fallback_extract_min_fields(tool_name: str, raw: Any) -> Optional[Dict[str, Any]]:
+            if not isinstance(raw, str):
+                return None
+            s = raw
+            # UUID(case_id) 추출
+            m = re.search(r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})", s, re.I)
+            case_id = m.group(1) if m else None
+
+            def _find_int(key: str) -> Optional[int]:
+                mm = re.search(rf'"{key}"\s*:\s*(\d+)|{key}\s*[:=]\s*(\d+)', s)
+                if not mm:
+                    return None
+                v = mm.group(1) or mm.group(2)
+                try:
+                    return int(v)
+                except Exception:
+                    return None
+
+            if tool_name == "admin.make_prevention":
+                rounds = _find_int("rounds")
+                if case_id and rounds is not None:
+                    return {"data": {"case_id": case_id, "rounds": rounds}}
+                if case_id:
+                    return {"data": {"case_id": case_id}}  # rounds는 뒤에서 캐시로 보정 가능
+                return None
+
+            if tool_name == "admin.save_prevention":
+                run_no = _find_int("run_no") or _find_int("run")
+                offender_id = _find_int("offender_id")
+                victim_id = _find_int("victim_id")
+                if case_id:
+                    d = {"case_id": case_id}
+                    if run_no is not None: d["run_no"] = run_no
+                    if offender_id is not None: d["offender_id"] = offender_id
+                    if victim_id is not None: d["victim_id"] = victim_id
+                    return {"data": d}
+                return None
+
+            return None
+
         parsed = _robust_action_input_to_dict(data)
         if not isinstance(parsed, dict) or not parsed:
-            # 원문 일부만 반환(디버깅)
-            return {
-                "ok": False,
-                "error": "tool_input_parse_failed",
-                "message": "Action Input을 JSON(dict)로 파싱하지 못했습니다.",
-                "raw_preview": (str(data)[:500] if data is not None else None),
-            }
+            # ✅ 마지막 방어: 최소 필드라도 regex로 구출해서 툴을 태운다
+            rescued = _fallback_extract_min_fields(tool_name, data)
+            if rescued:
+                parsed = rescued
+            else:
+                return {
+                    "ok": False,
+                    "error": "tool_input_parse_failed",
+                    "message": "Action Input을 JSON(dict)로 파싱하지 못했습니다.",
+                    "tool": tool_name,
+                    "raw_preview": (str(data)[:500] if data is not None else None),
+                }
 
         if require_data_wrapper:
             # 도구가 SingleData(args_schema=SingleData) 스타일이면 {"data": ...} 형태로 보장
@@ -837,11 +884,12 @@ def _wrap_tool_force_json_input(original_tool, *, require_data_wrapper: bool = T
         # ─────────────────────────────────────────
         sid = _current_stream_id.get() or "no_stream"
         if sid not in _EMO_CACHE:
-            _EMO_CACHE[sid] = {"turns_by_round": {}, "hmm_by_round": {}, "last_run_no": None}
+            _EMO_CACHE[sid] = {"turns_by_round": {}, "hmm_by_round": {}, "last_run_no": None, "prevention": None}
         # 방어: 키 누락되었을 수 있음(핫리로드/부분 갱신 등)
         _EMO_CACHE[sid].setdefault("turns_by_round", {})
         _EMO_CACHE[sid].setdefault("hmm_by_round", {})
         _EMO_CACHE[sid].setdefault("last_run_no", None)
+        _EMO_CACHE[sid].setdefault("prevention", None)
 
         # ─────────────────────────────────────────
         # ✅ (1) admin.make_judgement / admin.make_prevention 입력 자동 보정
@@ -1068,6 +1116,35 @@ def _wrap_tool_force_json_input(original_tool, *, require_data_wrapper: bool = T
                     "error": "tool_invoke_failed",
                     "message": str(e),
                 }
+        # ✅ (추가) make_prevention 결과 캐시
+        try:
+            if tool_name == "admin.make_prevention":
+                _EMO_CACHE[sid]["prevention"] = out
+        except Exception:
+            pass
+
+        # ✅ (추가) save_prevention 입력 자동 보정: summary/steps가 없으면 캐시에서 주입
+        try:
+            if tool_name == "admin.save_prevention":
+                d = parsed.get("data") if isinstance(parsed.get("data"), dict) else parsed
+                if isinstance(d, dict):
+                    if not d.get("summary") or not d.get("steps"):
+                        prev = _EMO_CACHE.get(sid, {}).get("prevention")
+                        prev_any = _loose_parse_json_any(prev)
+                        # out 형태: {"ok":true,"personalized_prevention":{...}} 또는 prevention 자체
+                        p = None
+                        if isinstance(prev_any, dict):
+                            p = prev_any.get("personalized_prevention") or prev_any
+                        if isinstance(p, dict):
+                            if not d.get("summary") and isinstance(p.get("summary"), str):
+                                d["summary"] = p.get("summary")
+                            if not d.get("steps") and isinstance(p.get("steps"), list):
+                                d["steps"] = p.get("steps")
+                        # 반영
+                        if "data" in parsed and isinstance(parsed["data"], dict):
+                            parsed["data"] = d
+        except Exception:
+            pass
         # ─────────────────────────────────────────
         # ✅ (2) label_victim_emotions 결과 캐시 저장
         # - input에 run_no를 반드시 포함시키도록 case_mission도 함께 수정되어야 함
@@ -2193,12 +2270,12 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
   * (risk.level == "critical" AND N >= 2) OR
   * N == {max_rounds}
 - 도구: admin.make_prevention
-- 입력: {{"data": {{"case_id": CASE_ID, "rounds": N, "turns": [모든라운드_TURNS_LABELED], "judgements": [모든judgement], "guidances": [모든guidance]}}}}
+- 입력(중요: 최소 JSON만): {{"data": {{"case_id": CASE_ID, "rounds": N}}}}
 - 저장: prevention_result
 
 단계 11: 예방책 저장 ← **필수**
 - 도구: admin.save_prevention
-- 입력: {{"data": {{"case_id": CASE_ID, "offender_id": {offender_id}, "victim_id": {victim_id}, "run_no": N, "summary": <10단계 summary>, "steps": <10단계 steps>}}}}
+- 입력(중요: summary/steps는 생략 가능, 서버가 자동 보정): {{"data": {{"case_id": CASE_ID, "offender_id": {offender_id}, "victim_id": {victim_id}, "run_no": N}}}}
 
 단계 12: Final Answer
 - 모든 단계 완료 후 최종 요약

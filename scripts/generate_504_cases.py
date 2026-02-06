@@ -44,7 +44,7 @@ from app.services.agent.orchestrator_react import run_orchestrated, _ensure_stre
 # 설정
 # =========================
 # 피해자 ID 목록 (seed에서 확인된 값)
-VICTIM_IDS = [8, 9, 10, 11, 12, 13]
+VICTIM_IDS = [9, 10, 11, 12, 13, 14]
 
 # 시나리오(offender) ID 목록 (seed에서 확인된 값)
 OFFENDER_IDS = [4]
@@ -60,7 +60,7 @@ MAX_TURNS = 20           # 한 라운드 최대 턴 수
 ROUND_LIMIT = 5          # 최대 라운드 수
 
 # JSON 저장 폴더
-DUMP_DIR = str(_ROOT / "scripts" / "case_json_504")
+DUMP_DIR = str(_ROOT / "scripts" / "case_json_504_c")
 
 # 시도 간 쉬기(레이트/서버 부하 완화)
 SLEEP_SEC = 0.5

@@ -1165,7 +1165,38 @@ def make_admin_tools(db: Session, guideline_repo):
         except Exception as e:
             raise HTTPException(status_code=422, detail=f"MakePreventionInput 검증 실패: {e}")
 
-        is_term, _reason = _is_terminal_case(pi.rounds, pi.judgements)
+        # (추가) 입력/자동로드 현황 로깅
+        logger.info(
+            "[admin.make_prevention] case_id=%s rounds=%s input_judgements=%d input_turns=%d input_guidances=%d",
+            str(pi.case_id),
+            pi.rounds,
+            len(pi.judgements or []),
+            len(pi.turns or []),
+            len(pi.guidances or []),
+        )
+
+        # ✅ judgements 미전달 시 DB에서 현재 라운드(run=rounds) 판정 자동 로드
+        judgements = list(pi.judgements or [])
+        if not judgements:
+            saved = _read_persisted_verdict(db, case_id=pi.case_id, run_no=pi.rounds)
+            if saved:
+                # (추가) 혹시 {"data": {...}} 형태면 unwrap + risk 키 보장
+                if isinstance(saved, dict) and "risk" not in saved and isinstance(saved.get("data"), dict):
+                    saved = saved["data"]
+                judgements = [saved]
+                logger.info(
+                    "[admin.make_prevention] judgement autoloaded from DB: run_no=%s risk=%s",
+                    pi.rounds,
+                    (saved.get("risk") if isinstance(saved, dict) else None),
+                )
+            else:
+                logger.warning(
+                    "[admin.make_prevention] no judgement found in input or DB: case_id=%s run_no=%s",
+                    str(pi.case_id),
+                    pi.rounds,
+                )
+
+        is_term, _reason = _is_terminal_case(pi.rounds, judgements)
         if not is_term:
             return {
                 "ok": False,
