@@ -44,7 +44,7 @@ from app.services.agent.orchestrator_react import run_orchestrated, _ensure_stre
 # 설정
 # =========================
 # 피해자 ID 목록 (seed에서 확인된 값)
-VICTIM_IDS = [9, 10, 11, 12, 13, 8]
+VICTIM_IDS = [12, 9, 10, 11, 13, 8]
 
 # 시나리오(offender) ID 목록 (seed에서 확인된 값)
 OFFENDER_IDS = [4]
