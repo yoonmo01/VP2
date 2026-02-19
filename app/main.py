@@ -26,9 +26,8 @@ from app.db.session import engine
 from app.db.base import Base
 
 # 기존 라우터들
-from app.routers import health, offenders, victims, conversations, admin_cases
-from app.routers import conversations_read, simulator as simulator_router
-from app.routers import agent as agent_router
+from app.routers import  offenders, victims
+from app.routers import conversations_read
 from app.routers.personalized import router as personalized_router
 from app.routers import react_agent_stream_router
 # React Agent 라우터만 추가
@@ -74,17 +73,12 @@ if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 # 기존 API 라우터들
-app.include_router(health, prefix=settings.API_PREFIX)
 app.include_router(offenders, prefix=settings.API_PREFIX)
 app.include_router(victims, prefix=settings.API_PREFIX)
-app.include_router(conversations, prefix=settings.API_PREFIX)
-app.include_router(admin_cases, prefix=settings.API_PREFIX)
 app.include_router(personalized_router, prefix="/api")
 
 # 기존 모듈 라우터들
 app.include_router(conversations_read.router, prefix=settings.API_PREFIX)
-app.include_router(simulator_router.router, prefix=settings.API_PREFIX)
-app.include_router(agent_router.router, prefix=settings.API_PREFIX)
 
 # React Agent 시스템 (MCP는 여기서 동적 호출)
 app.include_router(react_agent_router.router, prefix=settings.API_PREFIX)
