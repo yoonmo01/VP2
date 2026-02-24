@@ -65,7 +65,7 @@ class Settings(BaseSettings):
     TAVILY_API_KEY: str | None = None
 
     # LangSmith / LangChain tracing
-    LANGCHAIN_TRACING_V2: bool = True
+    LANGCHAIN_TRACING_V2: bool = False
     LANGCHAIN_API_KEY: str | None = None
     LANGCHAIN_PROJECT: str = "voice-phishing-sim"
 
