@@ -21,7 +21,6 @@ from app.services.agent.tools_sim import make_sim_tools
 from app.services.agent.tools_admin import make_admin_tools
 from app.services.agent.tools_mcp import make_mcp_tools
 from app.services.agent.tools_emotion import label_victim_emotions
-from app.services.agent.tools_tavily import make_tavily_tools
 from app.services.agent.guideline_repo_db import GuidelineRepoDB
 from app.core.logging import get_logger
 
