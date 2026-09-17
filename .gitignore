@@ -54,3 +54,4 @@ service-account-key.json
 
 *.jsonl
 *.zip
+/graphify-out
